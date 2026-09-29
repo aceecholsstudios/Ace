@@ -1,840 +1,841 @@
-# Ace: Design Document for an Automated Micro Equity Index Futures Bot
+# Ace: Design Document for an Order-Flow Scalping Bot on Tradovate Micros
 
 | | |
 |---|---|
-| **Status** | Draft v0.1 |
+| **Status** | Draft v0.2. Rewritten from the requirements Q&A; supersedes v0.1 |
 | **Author** | Ace Echols Studios |
-| **Last updated** | 2026-09-28 |
-| **Broker / API** | Tradovate (REST + WebSocket) |
-| **Instruments** | MNQ (Micro Nasdaq-100), MES (Micro S&P 500), M2K (Micro Russell 2000) |
-| **Primary goal** | Income generation: steady intraday P&L with tight drawdown control |
+| **Last updated** | 2026-09-29 |
+| **Broker / API** | Tradovate (REST + WebSocket), market data and orders |
+| **Instruments** | MES (Micro S&P 500), MNQ (Micro Nasdaq-100), M2K (Micro Russell 2000) |
+| **Account** | Personal cash account, under $5k |
+| **Host** | Home PC, Windows 11, with a PySide6 desktop dashboard |
 
 ---
 
 ## 1. Summary
 
-Ace is a standalone Python process that trades CME micro equity index futures
-through the Tradovate API. It runs unattended while the futures market is open.
-All trading logic (signals, sizing, risk, order management) lives inside the bot.
-Tradovate supplies market data, routes orders, and holds protective brackets on
-its servers.
+Ace is a Python program that runs on a home Windows PC. It scalps CME micro
+equity index futures through the Tradovate API, reading **order flow**: delta
+divergence, absorption, and aggressive sweeps. Trades last about 1–10 minutes.
+It trades three windows (Asia, London, and US regular hours), holds **one
+position at a time** across the three symbols, and is always flat outside those
+windows.
 
-The design follows three principles:
+All decisions happen inside the bot: signal detection, scoring, symbol
+selection, sizing, risk tiers, and trade management. Tradovate supplies
+market data (ticks, quotes, DOM) and executes orders. It also holds each
+trade's protective stop on its servers, so a stalled or crashed bot never
+leaves a position unprotected.
 
-1. **The broker is the source of truth.** The bot keeps a local model of orders
-   and positions, but it reconciles that model against Tradovate constantly and
-   treats any disagreement as an emergency.
-2. **Every open position is protected on the server.** Each entry goes out as a
-   bracket (entry + stop + target). If the bot crashes, loses its connection, or
-   the host dies, the stop is already working at Tradovate.
-3. **One codebase for research and live trading.** Strategies never call the API
-   directly. They see an abstract clock, a data feed, and a broker, so the same
-   strategy code runs in backtest, Tradovate market replay, demo, and live.
+A PySide6 desktop window, running in the same process as the engine, shows
+live charts, the signal scoreboard, risk state, and the trade journal. It also
+provides the controls: pause, flatten, symbol toggles, and live parameter
+edits.
+
+### 1.1 Decision record (from the requirements Q&A)
+
+| Area | Decision |
+|---|---|
+| Goal | Income generation |
+| Account / capital | Personal Tradovate cash account, under $5k |
+| Commission plan | Tradovate Free plan (pay per trade) |
+| Instruments | MES, MNQ, M2K (micros only) |
+| Trading windows | Asia 19:30–22:00 ET · London 02:30–05:00 ET · RTH 09:30–16:00 ET |
+| Window start | Wait 2–5 minutes after each window opens |
+| Window end | Flatten any open trade when the window closes |
+| Holding period | 1–10 minutes typical, **no** hard time stop |
+| Strategy style | Order flow / tape reading |
+| Signals | Delta divergence, absorption, aggressive sweeps |
+| Signal combination | Weighted score, **equal weights** to start |
+| Sweep definition | Any of: levels cleared in time, one-sided volume burst, large prints |
+| Absorption definition | Any of: volume at price without a break, DOM refill, delta without price progress (strongest wins) |
+| Divergence span | Multi-scale: 1-min and 5-min swings; higher score when both diverge |
+| Aggressor inference | Quote rule (at or above ask = buy, at or below bid = sell; midpoint split) |
+| DOM | Used for signals in v1 |
+| Data feed | Tradovate only, behind a data-source interface so it can be replaced later |
+| Threshold tuning | Rolling percentiles, same window, last 5 trading days |
+| Entry order | Market |
+| Stop placement | Just beyond the flow level that triggered the trade, plus a buffer |
+| Stop too wide for budget | Re-score on a cheaper-tick symbol (MNQ/M2K); otherwise skip |
+| Profit target | Next flow level (HVN, prior absorption zone, large DOM size, session high/low, VWAP); if none, trail only |
+| Trade management | Breakeven, then flow-based trailing |
+| Risk per trade | $25–$50 fixed |
+| Bad-day handling | Half size after 2 consecutive losses; stop for the window after 4 losses on the day |
+| Longer-term limits | Stop at 10% below equity peak (manual review); per-window edge-decay check |
+| Trade cap | 15 per day |
+| After a trade | 5-minute pause after a loss only |
+| Concurrency | One position at a time across all symbols |
+| Symbol selection | Best score: signal strength + room to target + recent symbol results |
+| News | Ignored (no calendar); spread and liquidity checks still apply |
+| Disconnect mid-trade | Rely on Tradovate-held stop and target; reconcile on reconnect |
+| Stray position at startup | Adopt it and attach a protective stop |
+| Contract roll | Automatic, when the next contract's volume overtakes the front month |
+| Storage | SQLite (trades and decisions), 1-min bars plus flow stats, trade screenshots |
+| Alerts | Dashboard only |
+| Dashboard | PySide6, same process as the engine |
+| Dashboard panels | Price and flow chart, signal scoreboard, position and risk, trade journal |
+| Dashboard controls | Pause/resume, flatten now, symbol toggles, live parameter edits |
+| Windows updates / sleep | Active hours set, sleep disabled |
+| Credentials | `.env` file, git-ignored |
+| Validation | Forward test on Tradovate demo; go live on manual sign-off |
+| Engineering rigor | Production-grade: mypy strict, unit and integration tests, fake Tradovate server, CI |
 
 ---
 
 ## 2. Goals and non-goals
 
 ### Goals
-- Trade MNQ, MES and M2K intraday, following an explicit session policy
-  (Section 5).
-- Aim for consistent daily results. Risk limits come first: a daily loss cap,
-  a per-trade risk budget, and portfolio exposure limits that account for
-  correlation.
-- Stay flat outside allowed trading windows. By default the bot is flat before
-  the day-margin cutoff, so it never pays overnight margin or carries gap risk.
-- Run unattended: reconnect by itself, renew tokens, handle contract rolls and
-  exchange holidays, alert a human on anomalies.
-- Keep a full audit trail. Every decision, order, fill and risk veto is
-  persisted with the inputs that produced it.
+- Scalp MES, MNQ and M2K with order-flow signals during the three active
+  windows, one trade at a time.
+- Keep each loss small and fixed ($25–$50), and slow down automatically on bad
+  days.
+- Run reliably on an ordinary home Windows PC with no special hardware.
+- Make every decision explainable. Each trade and each skipped signal is
+  stored with its score breakdown and reasons, and shown in the dashboard.
+- Learn from the data. Rolling percentile thresholds adapt on their own, and
+  per-signal and per-window statistics show what is working.
 
 ### Non-goals (v1)
-- Latency-sensitive scalping or HFT. Python over a retail API is not built for
-  it, and micro contract fees make it uneconomic (Section 7.4).
-- Instruments other than the three micros.
-- Holding positions overnight or over weekends.
-- A GUI. Monitoring happens through logs, metrics and alerts. A read-only
-  dashboard can come later.
-- Discretionary override inside the bot. A human can only **pause**,
-  **flatten**, or **kill** it (Section 11.4).
+- Trading outside the three windows, or holding a position through a window's
+  end.
+- Holding more than one position at a time, or spread and pair trades.
+- News-driven logic.
+- Phone or remote alerts.
+- Extra redundancy against home power or internet outages beyond the stops
+  held at Tradovate (Section 11.3).
+- Other instruments, or e-mini contracts.
 
 ---
 
-## 3. Instruments
+## 3. Instruments and cost reality
 
-| Symbol | Underlying | Multiplier | Tick size | Tick value | 1-point value |
-|---|---|---|---|---|---|
-| **MES** | S&P 500 | $5 × index | 0.25 | $1.25 | $5.00 |
-| **MNQ** | Nasdaq-100 | $2 × index | 0.25 | $0.50 | $2.00 |
-| **M2K** | Russell 2000 | $5 × index | 0.10 | $0.50 | $5.00 |
+| Symbol | Multiplier | Tick | Tick value | Typical role |
+|---|---|---|---|---|
+| **MES** | $5 × index | 0.25 | $1.25 | Deepest book; the most readable DOM |
+| **MNQ** | $2 × index | 0.25 | $0.50 | Fast; many ticks per move, small tick value |
+| **M2K** | $5 × index | 0.10 | $0.50 | Thinner; sharper sweeps, wider relative spread |
 
-**Contract months:** quarterly (H = Mar, M = Jun, U = Sep, Z = Dec). On
-2026-09-28 the front month is **Z6** (Dec 2026), so the symbols are `MESZ6`,
-`MNQZ6` and `M2KZ6`.
+Contracts are quarterly (H, M, U, Z). The active contract is picked
+automatically by volume (Section 9.4).
 
-**Expiration:** the third Friday of the contract month, at the 9:30 ET open (a
-special opening quotation). Liquidity moves to the next contract about 8 days
-earlier, around the Thursday before expiration week. The bot rolls on a
-configurable schedule (Section 9.3).
+### 3.1 Costs, the biggest challenge for this design
+Three of the choices all push costs up:
+- **Market orders** pay the spread on entry (usually 1 tick in RTH, sometimes
+  more in the Asia window).
+- The **Free commission plan** has the highest per-contract commission.
+- **Up to 15 trades a day** multiplies both.
 
-### 3.1 The three contracts are one bet
-The three index futures are highly correlated. Intraday return correlation is
-usually 0.8–0.95. Long MES + long MNQ + long M2K is essentially one large long
-position in US equities, not three independent trades. This fact shapes the
-risk design (Section 8.3):
+Round-trip cost per contract, commission plus exchange, clearing and NFA fees,
+is on the order of $1–$2 on the Free plan. **Use the exact numbers from your
+Tradovate statement in `config/fees.yaml`.** In ticks:
 
-- Exposure is measured in **beta-weighted dollars** (normalized to MES), not
-  contract counts.
-- By default, when several symbols signal the same direction at once, the bot
-  takes only the best candidate (relative-strength selection, Section 7.3).
+| | MES | MNQ | M2K |
+|---|---|---|---|
+| Fees (~$1.50 RT est.) in ticks | 1.2 | 3.0 | 3.0 |
+| + 1-tick market-order spread | 2.2 | 4.0 | 4.0 |
+| + ~1 tick slippage on the stop exit | ~3.2 | ~5.0 | ~5.0 |
+
+**What this means:** a trade has to move about 3 ticks on MES, or about 5 on
+MNQ/M2K, just to break even. So the design includes:
+- A **cost gate** in risk checks (Section 8.1): the distance to the target,
+  or for trail-only trades the expected move estimated from signal
+  statistics, must be at least `k ×` round-trip cost.
+- **Fee tracking everywhere.** P&L is always shown net of fees, and the
+  dashboard shows fees as a share of gross P&L.
+- A **plan break-even calculator** in the daily report: at your actual trade
+  count, how much the Monthly or Lifetime plan would save. Once the bot trades
+  most days, switching plans may be the cheapest improvement available.
 
 ---
 
-## 4. System architecture
+## 4. Architecture
 
 ### 4.1 Component overview
 
 ```
-                       ┌──────────────────────────────────────────────┐
-                       │                  Ace process                 │
-                       │                (Python asyncio)              │
-┌──────────────┐       │                                              │
-│  Tradovate   │  WS   │  ┌────────────┐     ┌──────────────────┐     │
-│ Market Data  ├───────┼─►│ MarketData │────►│   Bar Builder     │     │
-│  WebSocket   │       │  │  Service   │     │ (tick → 1m/5m…)   │     │
-└──────────────┘       │  └────────────┘     └────────┬─────────┘     │
-                       │                              │ Bar/Quote     │
-                       │                              ▼ events        │
-                       │  ┌────────────┐     ┌──────────────────┐     │
-                       │  │  Session   │────►│  Strategy Engine  │     │
-                       │  │ Scheduler  │gates│ (N strategies)    │     │
-                       │  │ + Calendar │     └────────┬─────────┘     │
-                       │  └─────┬──────┘              │ TradeIntent   │
-                       │        │                     ▼               │
-                       │        │            ┌──────────────────┐     │
-                       │        └───────────►│   Risk Manager    │     │
-                       │   flatten/halt      │ (pre-trade, sizing│     │
-                       │                     │  limits, kill sw.)│     │
-                       │                     └────────┬─────────┘     │
-                       │                              │ ApprovedOrder │
-                       │                              ▼               │
-┌──────────────┐       │  ┌────────────┐     ┌──────────────────┐     │
-│  Tradovate   │  WS   │  │  Account   │◄───►│  Execution / OMS  │     │
-│ Trading API  │◄──────┼─►│  State +   │     │ (bracket orders,  │     │
-│ (user sync,  │ REST  │  │ Reconciler │     │  lifecycle FSM)   │     │
-│  orders)     │       │  └────────────┘     └──────────────────┘     │
-└──────────────┘       │                                              │
-                       │  ┌────────────┐ ┌──────────┐ ┌───────────┐   │
-                       │  │ Persistence│ │ Metrics/ │ │  Alerts   │   │
-                       │  │ (SQLite/PG)│ │  Logs    │ │(Telegram…)│   │
-                       │  └────────────┘ └──────────┘ └───────────┘   │
-                       └──────────────────────────────────────────────┘
+┌────────────────────────── Ace (one Windows process) ─────────────────────────┐
+│                                                                              │
+│  Tradovate MD WS ──► MarketData ──► TradeClassifier ──► FlowEngine ──┐       │
+│   (ticks, quotes,      Service       (quote rule:        (delta, VP,   │       │
+│    DOM)                              buy/sell aggr.)      bars, DOM)   │       │
+│                                                                        ▼       │
+│  Session Scheduler ───gates───────────────────────────────► Signal Detectors   │
+│  (windows, holidays,                                         ├ Divergence      │
+│   warmup, flatten)                                           ├ Absorption      │
+│        │                                                     └ Sweep           │
+│        │                                                         │ scores      │
+│        │                                                         ▼             │
+│        │                                              Scorer + Symbol Selector │
+│        │                                                         │ TradeIntent │
+│        ▼                                                         ▼             │
+│   Risk Manager ◄──────────────────────────────────────────────────┘             │
+│   (tiers, caps, sizing, cost gate, peak DD, edge decay)                       │
+│        │ ApprovedOrder                                                         │
+│        ▼                                                                       │
+│   OMS / Trade Manager ◄──► Account Sync ◄──► Tradovate Trading WS/REST         │
+│   (bracket entry, BE, flow trail, target, flatten)                            │
+│                                                                              │
+│   Persistence (SQLite, Parquet, PNG)      PySide6 Dashboard (qasync)          │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 Why asyncio, single process
-- The workload is I/O-bound: two WebSockets, occasional REST calls, disk writes.
-  Strategy math on 1–5 minute bars for three symbols takes microseconds.
-- One event loop keeps the ordering of events **deterministic**. A fill, a bar
-  close and a risk check never race each other across threads. This matters
-  most for correctness and for replaying a day's events exactly.
-- CPU-heavy work, if any appears later (e.g. model inference), goes to a
-  `ProcessPoolExecutor` so it never blocks the loop.
+### 4.2 Concurrency model: asyncio and Qt in one process
+The engine and dashboard share one process, which you chose for simplicity.
+**`qasync`** makes the asyncio event loop and the Qt event loop the same loop,
+so there are no threads and no locks. Components still talk through typed,
+immutable events on an in-process bus.
 
-### 4.3 Internal event bus
-Components talk through typed, immutable events on an in-process bus (a small
-publish/subscribe layer over `asyncio.Queue`). Event types:
+Running the UI in the same process means the UI can **starve the trading
+logic** if it does heavy work. Rules that prevent this:
 
-| Event | Producer | Consumers |
-|---|---|---|
-| `Quote(symbol, bid, ask, last, ts)` | MarketData | BarBuilder, Risk (stale-data watchdog), OMS |
-| `Bar(symbol, tf, o,h,l,c,v, ts)` | BarBuilder | Strategies, Risk (volatility) |
-| `SessionChanged(state)` | Scheduler | Strategies, Risk, OMS |
-| `TradeIntent(...)` | Strategy | Risk |
-| `OrderRequest(...)` | Risk | OMS |
-| `OrderUpdate / Fill / PositionUpdate` | Account sync | OMS, Risk, Strategies, Persistence |
-| `Halt(reason, level)` | Risk / Watchdog / Operator | Everything |
+| Rule | Reason |
+|---|---|
+| The UI never subscribes to raw ticks. It reads a snapshot that the engine publishes at **5 Hz** (charts) and **2 Hz** (tables). | Tick bursts during sweeps can reach thousands per second. Redrawing on each one would freeze the loop. |
+| Charts use **pyqtgraph**, append-only, with a capped history. | pyqtgraph is designed for fast, live plotting in Qt. |
+| Screenshots render in a **separate worker process** (`ProcessPoolExecutor`) from saved data. | Rendering a PNG takes 100 ms or more, which is too long to block the event loop. |
+| Disk writes are batched and run in a thread via `asyncio.to_thread`. | SQLite commits must never stall order handling. |
+| A **loop-lag watchdog** measures event-loop delay every 250 ms. Over 200 ms it logs a warning; over 1 s with an open position it pauses new entries. | Catches a UI or code bug before it affects trades. |
+| Every control (Flatten, Pause) goes through the same command queue as automatic actions. | One code path is easier to test and to audit. |
 
-Every event is appended to an **event journal**. Replaying the journal through
-the same components reproduces every decision the bot made, which is the most
-useful tool for debugging after an incident.
+The engine can also start **headless** (`ace run --no-ui`). This is used for
+tests and CI, and it keeps the engine independent of the UI code.
 
 ---
 
-## 5. Session model: "trade while the market is open"
+## 5. Sessions and trading windows
 
-### 5.1 CME equity index futures hours (all times ET)
-- Globex trades **Sunday 18:00 through Friday 17:00**, with a daily
-  **17:00–18:00 maintenance halt**.
-- Regular trading hours (RTH), which match the cash equity session, run
-  **09:30–16:00**. Most liquidity and the cleanest intraday structure occur
-  here.
-- Holidays and early closes follow the CME holiday calendar (e.g. an early halt
-  on the day after Thanksgiving). The bot uses `exchange_calendars` (the
-  `CMES` calendar) plus a manually maintained override file for exceptions.
+All internal timestamps are UTC. Window logic uses `zoneinfo`
+(`America/New_York`), so daylight-saving changes are handled correctly.
 
-Internally, all timestamps are **UTC**. Session logic converts to
-`America/New_York` (or `America/Chicago`, the exchange's own zone) through
-`zoneinfo`, so DST changes are handled correctly.
+| Window | Hours (ET) | No-trade warmup | Notes |
+|---|---|---|---|
+| **Asia** | 19:30–22:00 | first 2–5 min (config) | Thinner books. Spread checks and percentile thresholds are specific to this window. |
+| **London** | 02:30–05:00 | first 2–5 min | Best overnight liquidity. |
+| **RTH** | 09:30–16:00 | first 2–5 min | Most activity. The 09:30 open is the most volatile moment of the day. |
 
-### 5.2 Session state machine
-
+### 5.1 Window state machine
 ```
- CLOSED ──(T-15m)──► WARMUP ──(open)──► ETH ──(09:30)──► RTH_OPENING ──(09:45)──► RTH
-   ▲                                                                              │
-   │                                                                          (15:45)
-   │                                                                              ▼
-   └──(17:00 halt / Fri close / holiday)── POST_RTH ◄──(16:00)── WIND_DOWN ◄───────┘
+IDLE ──(T-10m)──► PREPARING ──(open)──► WARMUP ──(+N min)──► ACTIVE ──(close)──► FLATTENING ──► IDLE
 ```
+- **PREPARING:** confirm Tradovate connections, reconcile the account, resolve
+  the active contract, and load this window's 5-day percentile tables.
+- **WARMUP:** build flow state (VWAP, volume profile, delta) from live data.
+  No entries.
+- **ACTIVE:** entries allowed, subject to risk checks.
+- **FLATTENING:** at window close, cancel working orders, close any position
+  at market, and confirm flat. This is a hard rule.
+- Holidays and early closes: `exchange_calendars` (CME calendar) decides
+  whether a window happens at all. A **live check** also runs: if quotes
+  aren't updating during PREPARING, the window is skipped.
 
-| State | Default behavior |
-|---|---|
-| `CLOSED` | No trading. Market-data sockets may disconnect; tokens are still renewed. |
-| `WARMUP` | Connect, authenticate, reconcile account, load history, rebuild indicators. |
-| `ETH` | **Disabled by default.** When enabled: half size, ETH-specific strategies only. |
-| `RTH_OPENING` | Build the opening range. Only strategies that declare `trades_open=True` may act. |
-| `RTH` | Main trading window. |
-| `WIND_DOWN` | No new entries. Existing positions are managed to exit. |
-| `POST_RTH` | Flatten all positions by the configurable cutoff (default 15:55 ET), cancel all orders, confirm flat. |
-
-**Why flat by default:** Tradovate's reduced **day-trade margin** for micros
-(often around $50 per contract, depending on account type) applies only during
-set hours. Holding past the broker's cutoff requires full exchange initial
-margin, which is many times larger. An overnight position also carries gap
-risk that an intraday stop cannot limit. For an income-focused bot, flat
-overnight is the safe default. Check Tradovate's current margin schedule, since
-the cutoff time and amounts change.
-
-### 5.3 Event blackouts
-A calendar of scheduled high-impact releases blocks new entries from T-2 min to
-T+5 min (configurable) and can tighten stops on open positions. Covered
-releases: CPI, NFP, FOMC decision and press conference, PCE, GDP, and major
-Treasury refunding. Source: a maintained YAML file, optionally fed by an
-economic-calendar API.
+### 5.2 News
+You chose to ignore scheduled news. No economic calendar is used. Protection
+still comes from the always-on checks: a spread limit, a quote-freshness
+limit, and the stop set at entry. Releases such as CPI at 08:30 ET and FOMC at
+14:00 ET fall inside or near RTH, so expect occasional large slippage on
+those days. The journal tags trades taken within ±5 minutes of the top-tier
+release times so their effect can be measured later.
 
 ---
 
 ## 6. Tradovate integration
 
-> Endpoint names and payloads below reflect Tradovate's public API as
-> understood at the time of writing. The integration layer must be verified
-> against the current docs (`api.tradovate.com`) and tested in the **demo**
-> environment before any live use.
+> Endpoint and payload details reflect Tradovate's public API as currently
+> understood. Everything must be verified against the current documentation
+> and the **demo** environment during milestone M1.
 
 ### 6.1 Prerequisites
-- A funded Tradovate account with the **API Access** add-on enabled.
-- API credentials (`cid` and `sec`) created in Tradovate's API key management
-  screen.
-- CME market data entitlement. Non-professional status keeps fees low.
-  API-delivered data may need its own subscription.
-- Environments:
-  - Demo REST: `https://demo.tradovateapi.com/v1`
-  - Live REST: `https://live.tradovateapi.com/v1`
-  - Trading WS: `wss://demo.tradovateapi.com/v1/websocket` or `wss://live.tradovateapi.com/v1/websocket`
-  - Market data WS: `wss://md.tradovateapi.com/v1/websocket`
-  - Replay WS (market replay for testing): `wss://replay.tradovateapi.com/v1/websocket`
+- A Tradovate account with **API Access** enabled, and an API key (`cid`,
+  `sec`).
+- A CME market data subscription that covers API access. Non-professional
+  status keeps the cost down.
+- Demo (`demo.tradovateapi.com`) is used for all development and the forward
+  test. Live (`live.tradovateapi.com`) is used only after sign-off.
 
-### 6.2 Authentication and token lifecycle
-1. `POST /auth/accesstokenrequest` with `name`, `password`, `appId`,
-   `appVersion`, `cid`, `sec`, `deviceId` (a stable UUID stored locally). The
-   response contains `accessToken`, `mdAccessToken`, `expirationTime`, and
-   `userId`.
-2. Tokens last roughly 90 minutes. The `AuthManager` renews through
-   `GET /auth/renewaccesstoken` when about 15 minutes remain, then updates
-   every consumer. Renewal does not create a new session; repeatedly requesting
-   new tokens does and can trigger rate limits.
-3. Secrets come from environment variables or a secret manager. They are never
-   stored in config files or logs. `deviceId` is stored so Tradovate always sees
-   one consistent device.
+### 6.2 Authentication
+- `POST /auth/accesstokenrequest` (`name`, `password`, `appId`, `appVersion`,
+  `cid`, `sec`, `deviceId`) returns `accessToken`, `mdAccessToken`, `userId`,
+  and `expirationTime`.
+- Tokens are renewed via `/auth/renewaccesstoken` about 15 minutes before
+  they expire.
+- The bot requests a fresh token only on startup or after a failed renewal.
+  Repeated logins can trigger rate-limit penalties.
+- `deviceId` is a UUID generated once and saved to `data/device_id`.
 
-### 6.3 WebSocket protocol (both sockets)
-Tradovate uses a SockJS-style framing:
+### 6.3 Credentials: `.env`
+```
+TRADOVATE_USERNAME=...
+TRADOVATE_PASSWORD=...
+TRADOVATE_CID=...
+TRADOVATE_SECRET=...
+TRADOVATE_ENV=demo
+```
+- `.env` is listed in `.gitignore` from the very first commit, and a
+  pre-commit hook blocks any file that contains these keys.
+- The values are loaded with `pydantic-settings` into `SecretStr` fields, so
+  they never appear in logs, repr output, or the dashboard.
+- Limitation: any program running under your Windows user can read `.env`.
+  Moving to Windows Credential Manager (`keyring`) later only changes one
+  loader function.
 
-| Frame from server | Meaning |
+### 6.4 WebSocket client
+Both sockets (trading and market data) use Tradovate's framed protocol:
+- `o` means the socket is open. The client then sends
+  `authorize\n0\n\n<token>`.
+- `h` is a heartbeat. `a[...]` carries data or responses. `c` means the server
+  is closing the socket.
+- Requests are sent as `endpoint\nid\nquery\nbody`. Each response is matched
+  to its request by `id` through a dictionary of `asyncio.Future` objects,
+  with a timeout.
+- The client sends a heartbeat (`[]`) about every 2.5 s. If no frame arrives
+  for more than 10 s, the socket is treated as dead and reconnected with
+  backoff. After reconnecting, the bot re-subscribes to everything and runs a
+  full reconciliation.
+- **Rate-limit penalty responses** (`p-ticket` / `p-time`): the client waits
+  the given time and retries with the ticket. A `p-captcha` response pauses
+  trading and shows an alert on the dashboard.
+
+### 6.5 Market data used
+| Subscription | Use |
 |---|---|
-| `o` | Socket open. Client must send `authorize\n0\n\n<token>` next. |
-| `h` | Server heartbeat. |
-| `a[...]` | JSON array of messages: responses (`{"i": id, "s": status, "d": data}`) or events (`{"e": "props" / "md" / "chart" ..., "d": ...}`). |
-| `c[code, reason]` | Server is closing the socket. |
+| `md/subscribeQuote` (per symbol) | Best bid/ask for the quote rule, spread checks, quote freshness |
+| `md/getChart`, tick chart (`underlyingType: "Tick"`, `elementSize: 1`) | Every trade: price, size, and the bid/ask at the time of the trade (verify these fields in M1). Feeds delta, volume profile, sweeps, and absorption. |
+| `md/subscribeDOM` (per symbol) | Visible depth for absorption (refill), target levels (large resting size), and liquidity checks. Tradovate provides a limited number of price levels, which is enough for the top of book. |
+| `md/getChart`, minute bars (warmup) | Backfill today's context (VWAP, session high and low) after a restart |
 
-Client requests are text frames of the form `endpoint\nrequestId\nquery\nbody`.
+All three symbols stream during every active window, because symbol
+selection needs live scores for all of them.
 
-The `TradovateSocket` class handles:
-- **Request/response correlation:** a monotonically increasing `requestId`
-  mapped to an `asyncio.Future` in a dict. Each request has a timeout.
-- **Heartbeats:** the client sends `[]` about every 2.5 s. If no server frame
-  arrives for more than 10 s, the socket is declared dead.
-- **Reconnect:** exponential backoff with jitter (1, 2, 4 … 30 s). After a
-  reconnect: re-authorize, re-subscribe, then **reconcile** (Section 9.2)
-  before trading resumes.
-- **Rate-limit penalties:** Tradovate can answer with a penalty (`p-ticket`,
-  `p-time`, sometimes `p-captcha`). The client waits `p-time` seconds, then
-  retries with the ticket. A captcha response is a hard halt that needs a
-  human.
-
-```python
-# Sketch of the core send/receive loop
-class TradovateSocket:
-    async def request(self, endpoint: str, body: dict | None = None,
-                      query: str = "", timeout: float = 5.0) -> dict:
-        rid = next(self._ids)
-        fut = asyncio.get_running_loop().create_future()
-        self._pending[rid] = fut
-        payload = json.dumps(body) if body is not None else ""
-        await self._ws.send(f"{endpoint}\n{rid}\n{query}\n{payload}")
-        try:
-            return await asyncio.wait_for(fut, timeout)
-        finally:
-            self._pending.pop(rid, None)
-
-    def _on_frame(self, raw: str) -> None:
-        kind, rest = raw[0], raw[1:]
-        if kind == "a":
-            for msg in json.loads(rest):
-                if "i" in msg and msg["i"] in self._pending:
-                    self._pending[msg["i"]].set_result(msg)
-                elif "e" in msg:
-                    self._bus.publish_raw(msg["e"], msg["d"])
-        elif kind == "h":
-            self._last_heartbeat = time.monotonic()
-        elif kind == "c":
-            self._schedule_reconnect()
-```
-
-### 6.4 Market data
-- `md/subscribeQuote {symbol}` streams best bid/ask, last and volume. It feeds
-  the stale-data watchdog and the OMS (for slippage accounting).
-- `md/getChart` with `chartDescription: {underlyingType: "Tick", elementSize: 1,
-  elementSizeUnit: "UnderlyingUnits"}` streams tick-level trades. The
-  **BarBuilder** aggregates them into 1-minute bars (and 5-minute, etc.). The
-  bot builds its own bars from ticks so bar boundaries and VWAP are computed
-  exactly the same way in live trading and in backtests.
-- On warmup, `md/getChart` with `MinuteBar` and a `timeRange` backfills enough
-  history (e.g. 20 sessions of 1-minute bars) to seed indicators such as ATR
-  and opening-range percentiles.
-- `md/subscribeDOM` is optional and off in v1. Order-book strategies are out of
-  scope.
-
-### 6.5 Account state: user sync
-`user/syncrequest {users: [userId]}` on the trading socket returns an initial
-snapshot (accounts, positions, orders, fills, cash balances) and then streams
-`props` events as entities are created or updated. The `AccountState`
-component:
-- Keeps the canonical in-memory copy of orders, fills, positions and cash
-  balance.
-- Publishes typed `OrderUpdate`, `Fill` and `PositionUpdate` events.
-- Is the **only** writer of position state. Strategies and risk read it; they
-  never assume a fill happened because an order was sent.
-
-### 6.6 Order placement
-Every automated order sets **`isAutomated: true`** (CME requires automated
-orders to be tagged). Entries go out as **OSO brackets** through
-`order/placeOSO`:
-
-```json
-{
-  "accountSpec": "<account name>",
-  "accountId": 123456,
-  "action": "Buy",
-  "symbol": "MESZ6",
-  "orderQty": 3,
-  "orderType": "Limit",
-  "price": 5712.25,
-  "isAutomated": true,
-  "bracket1": { "action": "Sell", "orderType": "Stop",  "stopPrice": 5706.25 },
-  "bracket2": { "action": "Sell", "orderType": "Limit", "price": 5724.25 }
-}
-```
-
-The two bracket legs form an OCO pair: when one fills, Tradovate cancels the
-other. Because Tradovate holds this linkage server-side, **the position stays
-protected even if Ace disappears.**
-
-Other operations:
-- `order/modifyorder` for stop trailing or moving the stop to breakeven.
-- `order/cancelorder` for unfilled entries after a timeout.
-- `order/liquidateposition` for emergency flattening (cancels working orders
-  and exits at market).
+### 6.6 Account sync and orders
+- `user/syncrequest` gives a snapshot, then streaming `props` updates for
+  orders, fills, positions and cash balance. The **AccountState** component
+  is the only writer of position state.
+- Entries use **`order/placeOSO`**: a market entry with two linked exit
+  orders, a stop and a limit target. When one fills, Tradovate cancels the
+  other. Trail-only trades send just the stop. All orders set
+  `isAutomated: true`.
+- `order/modifyorder` handles breakeven and trail moves. `order/cancelorder`
+  and `order/liquidateposition` handle flattening.
 
 ---
 
-## 7. Strategy layer
+## 7. Signal engine (order flow)
 
-### 7.1 Strategy interface
-Strategies are pure decision functions. They get state and events, and they
-return **intents**. They never place orders, size positions, or know about
-Tradovate.
+### 7.1 Trade classification: the quote rule
+Each trade from the tick stream is labeled by comparing its price with the
+bid and ask in effect when it happened:
 
-```python
-class Strategy(Protocol):
-    name: str
-    symbols: tuple[str, ...]          # subset of {"MES", "MNQ", "M2K"}
-    timeframes: tuple[str, ...]       # e.g. ("1m", "5m")
-    active_states: frozenset[SessionState]
+| Condition | Aggressor | Contribution to delta |
+|---|---|---|
+| price ≥ ask | Buyer | +size |
+| price ≤ bid | Seller | −size |
+| bid < price < ask (inside a wide spread) | Unknown | split: +size/2 and −size/2 (no net effect) |
 
-    def on_bar(self, bar: Bar, ctx: StrategyContext) -> list[TradeIntent]: ...
-    def on_fill(self, fill: Fill, ctx: StrategyContext) -> list[TradeIntent]: ...
-    def on_session(self, state: SessionState, ctx: StrategyContext) -> list[TradeIntent]: ...
+When the tick record includes bid/ask at trade time, those values are used.
+Otherwise the latest `subscribeQuote` values are used. Quote timing
+mismatches are the main source of misclassified trades, so the bot records
+the classification rate (share of trades labeled *unknown*) as a data-quality
+metric. If a pro feed with exchange aggressor flags replaces Tradovate later,
+only this component changes.
 
-@dataclass(frozen=True)
-class TradeIntent:
-    strategy: str
-    symbol: str                       # root, e.g. "MES"; OMS resolves to MESZ6
-    side: Side                        # LONG / SHORT / FLAT
-    entry: EntrySpec                  # market | limit@price | stop@price, + expiry
-    stop_price: float                 # REQUIRED; no stop, no trade
-    target_price: float | None
-    confidence: float = 1.0           # 0..1, used for size scaling and ranking
-    reason: str = ""                  # human-readable, persisted
+### 7.2 FlowEngine: shared state per symbol
+Detectors read from these structures, and the dashboard charts them:
+- **Cumulative delta**, reset at each window start.
+- **1-min and 5-min bars**, each with OHLC, volume, buy volume, sell volume,
+  delta, max single print, and trade count.
+- **Volume profile**, volume by price for the current window. Used to find
+  high-volume nodes (HVNs).
+- **Swing points** on the 1-min and 5-min bars (fractal-style: highs and lows
+  confirmed by N bars on each side).
+- **Session VWAP** and window high and low; prior day's RTH high and low.
+- **DOM snapshot**, including a history of size at each price, used for
+  refill detection.
+- **Absorption zone registry:** levels where absorption was detected, with
+  their side and strength. Also used as target levels.
+
+### 7.3 Adaptive thresholds: rolling percentiles
+"Large" and "heavy" are defined relative to recent history of the **same
+window over the last 5 trading days**. London volume is compared with past
+London sessions, never with RTH.
+
+- At the end of each window, the bot saves compact distributions (histograms
+  or quantile sketches) of each raw feature to SQLite, keyed by
+  `(symbol, window, feature, date)`. Features include burst volume, print
+  size, per-level volume, delta per window, and DOM size.
+- During PREPARING, it loads the last 5 days for the coming window and merges
+  them into percentile lookups. For example, "burst volume ≥ p95" becomes a
+  concrete number of contracts.
+- **Cold start:** until 5 days of history exist for a window, config
+  defaults are used and the dashboard marks the window as *calibrating*.
+  Recording starts in the first demo session.
+
+This works without full tick storage, because the features are summarized as
+they arrive.
+
+### 7.4 Detectors
+Each detector returns, per symbol, a **direction** (long or short) and a
+**strength from 0 to 1**, along with the price level the signal refers to.
+That level is used for stop placement.
+
+#### Aggressive sweep: fires on any of these
+1. **Levels in time:** one-sided aggression clears at least N price levels
+   within T ms (default 4 levels in 500 ms; per-symbol settings).
+2. **Volume burst:** one-sided aggressive volume in a rolling 1–5 s window is
+   at or above p95 of its 5-day distribution.
+3. **Large prints:** a single print, or a cluster with the same timestamp, at
+   or above p99 of print size.
+
+Strength is the highest of the three normalized sub-scores, plus a bonus
+when more than one fires. Direction follows the sweep. The level is where the
+sweep started.
+
+#### Absorption: the strongest of three methods
+1. **Volume at price without a break:** aggressive volume at one price is at
+   or above p90 of per-level volume, and price fails to trade through it for
+   T seconds.
+2. **DOM refill:** visible resting size at a level is hit repeatedly and
+   refills K or more times within T seconds.
+3. **Delta without progress:** strong one-sided delta (≥ p90) over a short
+   window while price moves less than X ticks in that direction.
+
+Direction is **against** the aggressor: sellers being absorbed means long.
+The level is the absorbed price. Each detection also goes into the
+absorption zone registry.
+
+#### Delta divergence: multi-scale
+- **1-min scale:** price makes a higher swing high (or lower swing low) while
+  cumulative delta at that swing does not.
+- **5-min scale:** the same test on 5-min swings.
+- Strength is 0.5 for a single scale and 1.0 when both scales diverge in the
+  same direction. It is further scaled by how large the gap is between the
+  price move and the delta move.
+- Direction is a reversal against the swing. The level is the swing extreme.
+
+### 7.5 Scoring
+```
+score(symbol, dir) = w_div × divergence + w_abs × absorption + w_sweep × sweep
+                     (v1: w = 1/3 each; each term in 0..1)
+enter only if score ≥ entry_threshold   (default 0.55; editable live)
+```
+- Signals decay. Each detector's value decreases over a configurable
+  half-life (default 60 s), so an absorption from 3 minutes ago counts only
+  slightly toward a sweep happening now.
+- Opposing signals subtract. A long score uses the long-side strengths minus
+  a fraction of the short-side ones.
+- Weights stay equal in v1. The **signal analytics** in the journal (P&L
+  grouped by which detectors contributed) is the evidence for changing them
+  after the demo period.
+
+### 7.6 Symbol selection (one position at a time)
+When one or more symbols cross the threshold within a short collection window
+(default 250 ms), each candidate gets a selection score:
+
+```
+selection = 0.6 × normalized_signal_score
+          + 0.3 × reward_to_risk_score      (distance to target ÷ stop distance; trail-only uses a neutral value)
+          + 0.1 × recent_symbol_score       (rolling net R of this symbol's last N trades in this window, clipped)
 ```
 
-`StrategyContext` gives read-only access to indicators, the current position,
-session information and today's P&L. **The required `stop_price` is the most
-important design choice in this layer.** A stop is part of the trade idea
-itself, and risk-based sizing (Section 8.2) is impossible without one.
-
-### 7.2 Starter strategy set
-These are well-understood intraday structures chosen as a starting point to
-validate the machinery. They are **hypotheses**, not proven edges. Each must
-pass the validation process in Section 10 before it trades real money.
-
-#### S1: Opening Range Breakout with a volatility filter (RTH trend days)
-- **Opening range (OR):** high and low from 09:30 to 09:45 ET.
-- **Filter:** trade only if OR width falls between the 20th and 80th percentile
-  of its last 20 sessions. A very narrow range often leads to false breakouts;
-  a very wide range means the day's move may already be spent.
-- **Entry:** a 5-minute bar closes beyond the OR, and price is on the same side
-  of session VWAP. Enter with a stop-limit one tick beyond the bar's extreme.
-- **Stop:** the OR midpoint or 1.0 × ATR(14, 5m), whichever is tighter.
-- **Exit:** 50% at 1.5R, then trail the rest behind the last completed 5-minute
-  swing. Close any remainder at WIND_DOWN.
-- **Frequency:** at most one attempt per direction per day, and at most one
-  symbol per direction (Section 7.3).
-
-#### S2: VWAP reversion (range days, midday)
-- **Active:** 10:30–15:00 ET, only when the day has **not** been classified as
-  a trend day (e.g. price has crossed VWAP at least N times, or the
-  ADX-equivalent is below a threshold).
-- **Entry:** price closes outside the ±2σ session VWAP band, and the next bar
-  shows rejection (closes back inside the band).
-- **Stop:** beyond the ±3σ band or the rejection bar's extreme.
-- **Target:** session VWAP.
-- **Guardrail:** disabled for the rest of the day once S1 has triggered and
-  worked. The two strategies express opposite views of the same day, and a
-  trend-day classification should silence mean reversion.
-
-#### S3 (later): Overnight-range or gap strategies for ETH
-Left out of v1. ETH liquidity in the micros is thin enough that slippage
-assumptions need their own study.
-
-### 7.3 Choosing among correlated instruments
-When a strategy produces the same directional intent on more than one symbol
-within a short window, the **Signal Arbiter** keeps one of them:
-- For longs, prefer the symbol with the strongest relative performance since
-  the open, measured in ATR units rather than percent. For shorts, prefer the
-  weakest.
-- Ties go to the symbol with the tighter spread relative to the stop distance
-  (usually MES).
-
-The idea is to express a directional view in the index where it is
-strongest, rather than tripling one bet.
-
-### 7.4 Cost economics of micros
-Commission plus exchange and NFA fees on micros run roughly **$0.50–$1.50 per
-side** depending on the Tradovate plan. Compare that with the tick values:
-
-| | MES | MNQ | M2K |
-|---|---|---|---|
-| Tick value | $1.25 | $0.50 | $0.50 |
-| Round-trip fees (~$1.50 est.) in ticks | ~1.2 | ~3.0 | ~3.0 |
-| + 1 tick slippage on stop exits | 2.2 ticks | 4.0 ticks | 4.0 ticks |
-
-Fees alone can cost several ticks per trade on MNQ and M2K. As a rule, **the
-average win must be large relative to costs.** Target at least 20 ticks on
-MNQ/M2K and 8 on MES. This is why v1 rules out scalping and why every backtest
-must include realistic fees and slippage. `config/fees.yaml` holds the real
-numbers from the Tradovate plan in use.
+The best candidate goes to risk checks. If risk rejects it only because
+**the stop is too wide for the budget**, the next-best candidate with a
+cheaper tick value (MNQ or M2K) is tried, if it also meets the threshold. If
+no candidate fits, the signal is logged as skipped.
 
 ---
 
 ## 8. Risk management
 
-Risk management is the most important component. It turns every intent into a
-sized, approved order or a logged veto, and it can halt the whole system.
+### 8.1 Pre-trade checks (the first failure rejects the trade)
+1. The bot isn't paused, the window is ACTIVE, and the symbol is enabled.
+2. No open position (one position at a time) and no working entry order.
+3. Not inside the 5-minute cooldown that follows a losing trade.
+4. The daily trade count is below 15.
+5. The daily loss tier allows trading (Section 8.3).
+6. The peak-drawdown and edge-decay locks are clear (Section 8.4).
+7. Data is healthy: the last quote is under 2 s old, the spread is within
+   limit for this window, the loop-lag watchdog is fine, and the account was
+   reconciled recently.
+8. Sizing gives at least 1 contract within budget (Section 8.2).
+9. Cost gate: the expected move is at least `k` × round-trip cost
+   (default `k = 3`).
 
-### 8.1 Pre-trade checks (in order; the first failure vetoes)
-1. System not halted, and session state allows entries for this strategy.
-2. No event blackout active.
-3. Market data fresh: last quote under 3 s old during RTH, and the spread
-   within normal range (≤ 2 ticks for MES, ≤ 4 for MNQ/M2K).
-4. Account state reconciled within the last N seconds.
-5. Daily loss limit not reached, and the worst case of this trade (a stop hit)
-   would not breach it.
-6. Per-symbol and portfolio exposure limits hold after the trade (Section 8.3).
-7. Trade-count and consecutive-loss limits not reached.
-8. Stop distance is sane: between 0.25× and 3× the current ATR.
-9. Cost check: the expected target distance is at least `k` × round-trip cost.
+Every rejection is logged with its reason and the full score breakdown. This
+feeds the missed-trade analysis.
 
-### 8.2 Position sizing
-Sizing is based on **fixed fractional risk**: the loss if the stop is hit
-equals a set dollar amount, whatever the instrument or volatility.
-
+### 8.2 Sizing
 ```
-risk_budget_$      = min(equity × risk_pct, max_risk_per_trade_$) × confidence
-per_contract_risk  = |entry − stop| × point_value + slippage_allow_$ + round_trip_fees_$
-contracts          = floor(risk_budget_$ / per_contract_risk)
-contracts          = min(contracts, max_contracts[symbol])
-if contracts == 0: veto ("stop too wide for budget")
+stop_price     = flow_level ∓ buffer_ticks          (beyond the level, per-symbol buffer)
+per_contract   = |entry_est − stop_price| × point_value
+               + spread_ticks × tick_value          (market entry)
+               + slip_ticks × tick_value            (stop exit)
+               + round_trip_fees
+risk_budget    = base_risk_usd × tier_multiplier    (base $25–$50; tier 1.0 or 0.5)
+contracts      = floor(risk_budget / per_contract)
+contracts == 0 → "stop too wide": try another symbol (7.6), else skip
 ```
 
-**Worked example:** equity $10,000, risk 0.75% gives $75.
-MES long at 5712.25 with stop 5706.25, a 6-point stop:
-`6 × $5 = $30`, plus 1 tick of slippage ($1.25), plus about $1.50 in fees,
-gives **$32.75 per contract**. Floor(75 / 32.75) = **2 contracts**.
-The same trade on MNQ with a 24-point stop: `24 × $2 = $48 + $0.50 + $1.50 =
-$50`, which gives 1 contract.
+**Example:** budget $40. An MES absorption at 5712.00, long, 2-tick buffer,
+stop at 5711.50. Entry is about 5712.50 (market at the ask), so the stop
+distance is 1.00 point, or $5. Add $1.25 spread + $1.25 slippage + $1.50 fees
+to get **$9.00 per contract**, which gives 4 contracts. A comparable MNQ setup
+with a 16-tick stop: $8 + $0.50 + $0.50 + $1.50 = $10.50, which gives 3
+contracts.
 
-Sizing in dollars of risk, not contracts, is what makes three instruments with
-different volatility comparable.
+Market-order entries fill at an unknown price. Once the fill arrives, the
+stop stays at the flow level, so the **real** risk is recomputed. If slippage
+pushed it more than 25% over budget, it is logged and counted in the slippage
+statistics.
 
-### 8.3 Portfolio and correlation limits
-- **Beta-weighted exposure:** each position is converted to MES-equivalent
-  notional:
-  `exposure = qty × price × multiplier × β_vs_SPX`.
-  β is estimated daily from 60 days of returns (MNQ is typically about 1.2,
-  M2K about 1.1–1.3). The absolute net exposure is capped
-  (e.g. ≤ 2× equity notional).
-- **Correlated open risk:** the sum of open stop-risk across same-direction
-  positions is capped (e.g. 1.5 × the single-trade budget).
-- **Per-symbol caps:** maximum contracts per symbol, set in config.
-
-### 8.4 Daily and session limits (the income-preservation layer)
-| Limit | Default | Action |
+### 8.3 Daily tiers (count-based)
+| State | Trigger | Effect |
 |---|---|---|
-| Daily max loss (realized + open) | 2% of equity (or a fixed $) | Flatten, halt until the next session |
-| Daily profit lock (optional) | After +X%, cut risk_pct in half; after giving back 50% of peak, stop | Protects good days |
-| Max consecutive losses | 3 | Pause 60 min, then half size for the rest of the day |
-| Max trades per day | 6 | No new entries |
-| Weekly max drawdown | 5% | Halt until a human re-enables |
-| Account equity floor | Configured $ | Kill; manual restart required |
+| **Normal** | Start of each trading day (18:00 ET roll) | Full base risk |
+| **Tier 1 (half size)** | 2 consecutive losses | `tier_multiplier = 0.5` until a winning trade resets it |
+| **Tier 2 (stopped)** | 4 losing trades on the day | No new entries until the next trading day |
 
-### 8.5 Kill switch and halt levels
-| Level | Trigger examples | Effect |
+Breakeven exits (within ±fees) count as neither a win nor a loss. The day
+starts with the Asia window, following CME's trading-day convention.
+
+### 8.4 Longer-term locks
+- **Peak drawdown, 10%.** If account equity drops 10% below its all-time
+  high, the bot stops all trading and shows a *review required* banner. Only
+  an explicit dashboard action, which is logged, re-enables trading.
+- **Edge decay, per window.** Net expectancy after fees is tracked separately
+  for Asia, London and RTH over the last N trades in each (default 40). If a
+  window's expectancy turns negative, **only that window** is disabled, and
+  the dashboard shows it. You re-enable it manually after reviewing.
+
+### 8.5 Halt levels
+| Level | Examples | Effect |
 |---|---|---|
-| `PAUSE` | Consecutive losses, blackout, operator command | No new entries; existing brackets stay |
-| `FLATTEN` | Daily loss limit, end of session, stale data for more than 30 s with an open position | Cancel all orders, liquidate positions, confirm flat |
-| `KILL` | Position mismatch not resolved, repeated order rejects, equity floor, captcha penalty, unexpected exception in OMS/Risk | Flatten, then stop the process and page a human. Restart requires manual action. |
+| `PAUSE` | Operator pause, cooldown, loop lag, stale quotes | No new entries; the open trade keeps being managed |
+| `FLATTEN` | Window end, operator "Flatten now", Tier 2 hit with a trade open (it finishes first), peak-DD lock | Cancel all orders, close the position, confirm flat |
+| `STOP` | Unresolved reconciliation mismatch, repeated order rejects, `p-captcha`, unexpected exception in risk/OMS | Flatten, disable trading, show a red banner; needs manual restart |
 
 ---
 
-## 9. Execution and order management (OMS)
+## 9. Execution and trade management
 
-### 9.1 Order lifecycle state machine
-
+### 9.1 Order lifecycle
 ```
- NEW ─► PENDING_SUBMIT ─► WORKING ─► PARTIALLY_FILLED ─► FILLED
-             │               │               │
-             ▼               ▼               ▼
-         REJECTED        CANCELLED     CANCELLED (remainder)
-             │               ▲
-             └── (timeout) ──┘   EXPIRED (entry not filled within its TTL)
+NEW → PENDING_SUBMIT → WORKING → FILLED
+            │             │
+            ▼             ▼
+         REJECTED     CANCELLED
 ```
+- Client order IDs use the form `ace-<uuid8>` and are saved **before**
+  sending.
+- **No blind resends.** If there's no acknowledgment within 5 s, the bot
+  checks Tradovate for the order's state before doing anything else.
+- **Market entry** is sent via `placeOSO`, with the stop (and the target, if
+  there is one) attached. Once the fill arrives, bracket quantities follow
+  the filled quantity.
 
-- Every bot order carries a **client order ID** (`ace-<strategy>-<uuid8>`),
-  saved before sending. This connects Tradovate order IDs back to the intent
-  that produced them.
-- **Partial fills:** bracket quantities follow the filled quantity. Unfilled
-  entries are cancelled at TTL, and the position runs with brackets sized to
-  what actually filled.
-- **Timeouts:** if a placement gets no response in 5 s, the OMS **does not
-  resend**. It queries order state first. A blind resend is the classic way to
-  double a position.
-- **Breakeven and trail moves** are sent as `modifyorder` on the stop leg. The
-  new stop is kept only after acknowledgment.
+### 9.2 Managing the open trade
+1. **Initial:** stop just beyond the flow level. Target at the next flow
+   level, or none (trail only).
+2. **Breakeven:** when price moves in favor by the initial risk distance
+   (+1R, configurable), the stop moves to entry + fees.
+3. **Flow trail**, after breakeven. The stop tightens when:
+   - delta stalls: cumulative delta in the trade's direction fails to make
+     progress for N seconds while price is flat, or
+   - an opposing sweep or absorption with strength ≥ θ appears. The stop
+     then moves to just beyond the most recent 1-minute swing, or to a
+     configurable fraction of open profit.
+4. **Targets** are chosen from these candidates, taking the nearest one at a
+   meaningful distance (≥ 1R) in the trade's direction:
+   - high-volume nodes in the window's volume profile,
+   - opposing absorption zones from the registry,
+   - large resting DOM size (≥ p95 of this window's DOM size),
+   - window high or low, prior RTH high or low, and session VWAP.
 
-### 9.2 Reconciliation
-Runs at startup, after every reconnect, and every 30 s during trading:
-1. Pull positions, working orders and fills from Tradovate.
-2. Compare them with local state.
-3. Resolve differences:
-   - **Unknown position, no local record:** by default, flatten and alert.
-     (Config option: adopt it and attach a protective stop at X × ATR.)
-   - **Local position that Tradovate does not show:** trust Tradovate, mark the
-     local record closed, alert.
-   - **Position without a working stop:** attach an emergency stop
-     immediately, alert.
-   - **Anything unresolved after 2 cycles:** `KILL`.
+   If none qualify, the trade is **trail only**.
+5. **Window end:** forced flatten (Section 5.1).
+6. There is **no time stop**. A trade exits only through its stop, target,
+   trail, window end, or an operator or risk flatten.
 
-### 9.3 Contract roll
-- `ContractResolver` maps root symbols (`MES`) to the active contract
-  (`MESZ6`) using the expiration calendar and a roll offset (default: roll 8
-  calendar days before expiration, at the start of the session).
-- Since the bot is flat every night, rolling only means switching which
-  contract new subscriptions and orders use. No spread trades are needed.
-- Indicator history splices across the roll using ratio or difference
-  back-adjustment, so ATR and levels do not jump.
-- A pre-roll check confirms that the new contract resolves via `contract/find`
-  and has streaming quotes before switching.
+Every stop change is sent as `modifyorder`, and the local record updates only
+after Tradovate acknowledges it. Stop moves only ever reduce risk, never widen
+it.
 
----
+### 9.3 Reconciliation and stray positions
+Reconciliation runs at startup, after every reconnect, and every 30 s while a
+trade is open.
+- **Local and Tradovate disagree:** Tradovate is treated as correct. The
+  local state is corrected and the event is logged.
+- **Position with no working stop:** a stop is attached immediately at the
+  planned level, or at an ATR-based fallback.
+- **Stray position at startup** (not opened by Ace): **adopt it.** The bot
+  attaches a protective stop at `max(recent swing, 1.5 × ATR(1m))` away,
+  starts managing it with the flow trail, and flags it in the journal as
+  adopted. The stop's risk is clipped to the budget only if the position is
+  small enough. Otherwise the stop sits at the fallback distance and a
+  warning banner appears.
+- A mismatch that isn't resolved within 2 cycles triggers `STOP`.
 
-## 10. Research, backtesting and validation
-
-### 10.1 Data
-- **Historical:** Tradovate's chart API only offers limited history. For
-  research, buy CME Globex tick or 1-minute data for MES, MNQ, M2K and
-  (for longer history) ES, NQ, RTY. Vendors include Databento, FirstRate
-  Data, and others. Micros launched in May 2019; before that, the e-minis are
-  a proxy with the same price series and 10× the multiplier.
-- **Storage:** Parquet files partitioned by `symbol/date`, read through
-  Polars.
-- **Live capture:** the bot records every tick it receives to Parquet. Over
-  time this becomes a dataset that exactly matches what the live system saw.
-
-### 10.2 Backtest engine
-An event-driven engine that **reuses the production Strategy, Risk and
-BarBuilder code** and swaps in:
-- `SimClock` in place of the wall clock.
-- `SimBroker` in place of the Tradovate OMS adapter, with this fill model:
-  - Market and stop orders: fill at next trade price + N ticks of slippage.
-    N is configurable per symbol and higher around the open and news.
-  - Limit orders: fill only when price trades **through** the limit (a touch
-    is not enough), which approximates queue position conservatively.
-  - Fees from `fees.yaml`.
-
-### 10.3 Validation procedure (required before live)
-1. **In-sample development** on 2019–2023.
-2. **Walk-forward optimization:** re-fit parameters on a rolling 12-month
-   window and test on the following 3 months. Report only the stitched
-   out-of-sample results.
-3. **Parameter robustness:** results must hold across a neighborhood of
-   parameter values. A sharp performance peak signals overfitting.
-4. **Monte Carlo on the trade sequence:** resample trades to estimate the
-   distribution of max drawdown and losing streaks. Set the daily and weekly
-   limits from these numbers, not from intuition.
-5. **Holdout:** the most recent 6+ months are touched only once, at the end.
-6. **Tradovate Market Replay:** run the full live stack against replayed
-   market days to exercise real API behavior.
-7. **Demo (paper) trading:** at least 4–6 weeks. Compare live fills against
-   the backtest's predicted fills for the same days; the gap is the real
-   slippage.
-8. **Live at minimum size:** 1 contract, with the smallest risk budget, for
-   4+ weeks before scaling up.
-
-**Go-live criteria (per strategy):** positive out-of-sample expectancy after
-costs; profit factor > 1.3; out-of-sample Sharpe > 1.0 on daily returns; a
-Monte Carlo 95th-percentile drawdown within the risk budget; demo results
-within the backtest's expected range.
+### 9.4 Contract roll (by volume)
+Each day during PREPARING, the bot compares the front and next contracts'
+volume from the prior session, using Tradovate chart data. On the first day
+the next contract's volume is higher, the active contract switches, and the
+dashboard shows a banner with both contract names. This normally happens
+about 8 days before expiration. The bot is always flat between windows, so a
+roll never involves moving a position.
 
 ---
 
-## 11. Operations
+## 10. Data, storage and reporting
 
-### 11.1 Deployment
-- **Host:** a small Linux VPS near Chicago/Aurora, or cloud in `us-east-2` /
-  `us-central`. Latency is not critical, but a stable network is.
-- **Runtime:** Docker container under `systemd` (or Docker's
-  `restart: unless-stopped`). Time synced through `chrony`.
-- **Daily lifecycle:** the process runs continuously and follows the session
-  state machine. A weekly restart (Saturday) picks up new configuration and
-  calendars.
-
-### 11.2 Persistence
-- **SQLite** (WAL mode) in v1, with the option to move to Postgres. Tables:
-  `intents`, `risk_decisions`, `orders`, `order_events`, `fills`,
-  `positions_snapshots`, `daily_pnl`, `halts`.
-- **Event journal:** append-only JSONL, rotated daily.
-- **Tick capture:** Parquet.
-
-### 11.3 Observability
-- **Logs:** `structlog`, JSON, one line per event, with correlation IDs
-  (`intent_id` → `client_order_id` → `tradovate_order_id`).
-- **Metrics:** Prometheus client covering P&L, open risk, exposure, latency
-  (signal → ack, ack → fill), quote age, reconnect count and reject count.
-  Optional Grafana on top.
-- **Alerts** (Telegram, Discord or Pushover):
-  - Info: session start/end summary, daily P&L report.
-  - Warn: reconnects, soft limits hit, rejects.
-  - Critical: halts, reconciliation mismatch, missing stop, process crash.
-- **External dead-man's switch:** the bot pings a monitoring service (e.g.
-  Healthchecks.io) every minute during trading hours. Missed pings page the
-  operator, which catches the case where the host itself is dead.
-
-### 11.4 Operator controls
-A small authenticated control channel, either Telegram bot commands restricted
-to one user ID or a local CLI over a Unix socket:
-`status`, `pause`, `resume`, `flatten`, `kill`, `set-risk <pct>`, `disable <strategy>`.
-Every command is logged. There is intentionally **no** command to open a trade
-manually.
-
-### 11.5 Failure-mode table
-
-| Failure | Detection | Response |
+| Store | Contents | Format |
 |---|---|---|
-| Market-data socket drops | No frames for more than 10 s | Reconnect; PAUSE entries; FLATTEN if still down after 30 s with an open position |
-| Trading socket drops | Heartbeat timeout | Reconnect and reconcile; brackets on the server protect positions meanwhile |
-| Token expires | Expiry timer, or a 401 response | Renew; on failure, re-authenticate; if that fails, KILL |
-| Order placement times out | No ack within 5 s | Query state; never blind-resend |
-| Fill without a stop | Reconciliation | Attach an emergency stop; alert |
-| Price-limit halt or exchange halt | Quote stall plus exchange status | PAUSE; brackets remain; alert |
-| Bot process crash | systemd plus dead-man's switch | Auto-restart, then startup reconciliation; server brackets cover the gap |
-| Host or VPS dies | Dead-man's switch | Human steps in (Tradovate app/web); server brackets cover the gap |
-| Rate-limit penalty | `p-ticket` response | Wait `p-time`, retry; `p-captcha` means KILL |
-| Bad tick (price spike) | Deviation more than X × ATR from the last N ticks | Drop it from bar building; log |
-| Clock drift | chrony status check | Alert when drift exceeds 250 ms |
+| `data/ace.db` | Signals (with every detector's sub-scores), selection decisions, risk rejections, orders, order events, fills, trades, daily and per-window stats, percentile histograms, halts, operator actions, and parameter changes | SQLite (WAL mode) |
+| `data/bars/` | 1-min bars with flow stats (buy/sell volume, delta, max print, DOM imbalance summary) for each symbol | Parquet, partitioned by `symbol/date` |
+| `data/shots/` | One PNG per trade: 1-min chart with entry, stop moves, exit, target, and the triggering signals marked, plus a delta subplot | PNG, rendered in a worker process |
+| `logs/` | Structured JSON logs (`structlog`), rotated daily | JSONL |
+
+Full tick and DOM recording is **off** (you didn't select it). The 1-min flow
+bars plus the percentile histograms are enough for the dashboard, reporting,
+and threshold adaptation. A `record_ticks: true` switch can be added later if
+you want to build a replay dataset.
+
+**Reports** (dashboard tab and HTML export):
+- Daily: net P&L, fees, fees as % of gross, win rate, average R, and
+  breakdowns by window and symbol.
+- Signal analytics: P&L grouped by detector combination and by score range.
+- Missed trades: rejected signals, with the result of a hypothetical fill.
+- Commission-plan comparison at the actual trade count.
 
 ---
 
-## 12. Configuration
+## 11. Dashboard (PySide6)
 
-```yaml
-# config/ace.yaml (secrets come from environment variables, never this file)
-environment: demo            # demo | live | replay
-account_spec: "DEMO1234567"
-symbols: [MES, MNQ, M2K]
-
-session:
-  timezone: America/New_York
-  trade_eth: false
-  flatten_at: "15:55"
-  wind_down_at: "15:45"
-  blackout_calendar: config/events.yaml
-  blackout_window: { before_min: 2, after_min: 5 }
-
-roll:
-  days_before_expiry: 8
-
-risk:
-  risk_pct_per_trade: 0.0075
-  max_risk_per_trade_usd: 150
-  daily_max_loss_pct: 0.02
-  weekly_max_dd_pct: 0.05
-  max_consecutive_losses: 3
-  max_trades_per_day: 6
-  max_contracts: { MES: 4, MNQ: 4, M2K: 4 }
-  max_beta_weighted_exposure_x_equity: 2.0
-  max_spread_ticks: { MES: 2, MNQ: 4, M2K: 4 }
-  stale_quote_sec: 3
-
-execution:
-  entry_ttl_sec: 120
-  ack_timeout_sec: 5
-  slippage_allow_ticks: { MES: 1, MNQ: 2, M2K: 2 }
-
-strategies:
-  orb:
-    enabled: true
-    symbols: [MES, MNQ, M2K]
-    or_minutes: 15
-    width_pct_band: [20, 80]
-    stop_atr_mult: 1.0
-    partial_r: 1.5
-  vwap_reversion:
-    enabled: false           # enable after validation
-    entry_sigma: 2.0
-    stop_sigma: 3.0
+### 11.1 Layout
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ [● DEMO] Window: LONDON  ACTIVE   Tier: Normal   Trades 6/15   [PAUSE] [FLATTEN] │
+├───────────────────────────────────────────┬──────────────────────────────┤
+│ Price + flow chart (pyqtgraph)            │ Signal scoreboard            │
+│  1-min candles · VWAP · HVNs · absorption │  MES  L 0.41 ▓▓▓▓░░  S 0.12   │
+│  zones · sweep markers · stop/target lines│  MNQ  L 0.58 ▓▓▓▓▓▓  S 0.05 ◄ │
+│  ─────────────────────────────────────── │  M2K  L 0.22 ▓▓░░░░  S 0.30   │
+│  cumulative delta subplot                 │  threshold 0.55 · div/abs/swp  │
+│  [MES] [MNQ] [M2K] symbol tabs            ├──────────────────────────────┤
+│                                           │ Position & risk              │
+│                                           │  MNQ long 3 @ 20115.25        │
+│                                           │  stop 20111.00 (BE) tgt HVN   │
+│                                           │  Day P&L +$62.50 (fees $13.50) │
+│                                           │  DD from peak 2.1% · windows ✓✓✓│
+├───────────────────────────────────────────┴──────────────────────────────┤
+│ Trade journal: time · symbol · side · qty · entry · exit · R · net · reasons · 📷 │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-Config is loaded into **Pydantic** models, so a typo or an out-of-range value
-fails at startup rather than at 10:03 on a trading day.
+### 11.2 Controls
+| Control | Behavior |
+|---|---|
+| **Pause / Resume** | Blocks new entries; the open trade is still managed |
+| **Flatten now** | Confirmation dialog, then close the position and cancel orders |
+| **Symbol toggles** | Enable or disable MES, MNQ, M2K individually (applies to new entries only) |
+| **Live parameter edits** | A panel for an allowlisted set of parameters: `entry_threshold`, `base_risk_usd` (capped at $50), `max_trades_per_day`, detector weights, `buffer_ticks`. Every change is validated, logged with old and new values, and persisted. |
+| **Review locks** | Re-enable after the peak-DD lock or a window's edge-decay lock (requires typing a confirmation) |
+
+There is deliberately **no manual order entry.** You can stop the bot, but
+you can't trade through it.
+
+### 11.3 Alerts
+Alerts appear only on the dashboard: a status bar color, a banner, and a
+Windows toast while the window is open. Two design choices keep overnight
+risk small without phone alerts:
+- Every trade's stop sits at Tradovate from the moment of entry.
+- Every window ends with a forced flatten, so the bot never carries a
+  position through a quiet period.
+
+The dashboard shows a **"since you last looked"** summary: trades, P&L,
+halts and reconnects since the window last had focus.
 
 ---
 
-## 13. Project layout and tech stack
+## 12. Running on the home PC
 
+- **Windows 11.** Set active hours to cover the trading windows and disable
+  sleep and hibernate on AC power. The installer checklist and `ace doctor`
+  command check these settings.
+- **Startup:** `ace run` opens the dashboard and engine together. A
+  shortcut can be added to the Startup folder if wanted.
+- **Clock:** `ace doctor` checks that Windows time sync is on and that the
+  clock drift against an NTP server is under 250 ms. Bar boundaries and the
+  quote rule depend on accurate time.
+- **Restart safety:** after any restart, startup reconciliation (Section 9.3)
+  runs before anything else.
+- **Portability:** the engine has no Windows-only code outside `ops/`, and
+  it can run headless. That keeps CI (Linux) and any later move cheap,
+  though no move is planned.
+
+---
+
+## 13. Validation and going live
+
+1. **Build and test** against the fake Tradovate server (Section 14.2).
+2. **Demo forward test** on Tradovate demo during all three windows.
+   - The first 5 trading days are mainly *calibration*: percentile tables fill
+     in and the bot trades with default thresholds.
+   - Watch these closely: classification rate, fees as % of gross,
+     per-detector P&L, slippage on market entries, and loop lag.
+   - Demo fills are simulated by Tradovate and tend to be **more generous**
+     than live, especially for market orders in the Asia window. Treat demo
+     results as an upper bound.
+3. **Manual sign-off** (your decision). The dashboard's review report gives
+   you: trade count, net expectancy after fees per window and per symbol,
+   max drawdown, operational incident count, and the demo slippage
+   distribution.
+4. **Live** with `TRADOVATE_ENV=live`. The dashboard shows a red **LIVE**
+   badge, and the first live day uses the minimum budget ($25) no matter what
+   the config says.
+
+---
+
+## 14. Codebase
+
+### 14.1 Layout
 ```
 ace/
-├── pyproject.toml
-├── config/                  # ace.yaml, fees.yaml, events.yaml, holidays_override.yaml
+├── pyproject.toml            # uv-managed; Python 3.12
+├── .env.example              # keys only, no values
+├── .gitignore                # .env, data/, logs/
+├── config/
+│   ├── ace.yaml              # all tunables (Section 15)
+│   └── fees.yaml             # Free-plan rates from your statement
 ├── src/ace/
-│   ├── app.py               # wiring and entrypoint
-│   ├── core/                # events, bus, clock, types (Side, Bar, TradeIntent…)
-│   ├── tradovate/           # auth.py, socket.py, rest.py, md.py, sync.py, orders.py, models.py
-│   ├── data/                # bar_builder.py, indicators.py, tick_recorder.py, history.py
-│   ├── session/             # calendar.py, scheduler.py, blackout.py, contracts.py (roll)
-│   ├── strategies/          # base.py, orb.py, vwap_reversion.py, arbiter.py
-│   ├── risk/                # manager.py, sizing.py, limits.py, exposure.py, killswitch.py
-│   ├── execution/           # oms.py, order_fsm.py, reconciler.py
-│   ├── persistence/         # db.py, journal.py
-│   ├── ops/                 # alerts.py, metrics.py, control.py, healthcheck.py
-│   └── backtest/            # engine.py, sim_broker.py, sim_clock.py, reports.py
+│   ├── app.py                # wiring, qasync loop, CLI (run / doctor / report)
+│   ├── core/                 # event bus, clock, types, commands
+│   ├── tradovate/            # auth, socket, md, sync, orders, models (pydantic)
+│   ├── flow/                 # classifier (quote rule), engine, bars, profile, swings, dom
+│   ├── signals/              # divergence, absorption, sweep, percentiles, scorer, selector
+│   ├── session/              # windows, scheduler, calendar, roll
+│   ├── risk/                 # checks, sizing, tiers, locks, edge_decay
+│   ├── execution/            # oms, order_fsm, trade_manager (BE / trail / target), reconciler
+│   ├── persistence/          # db, bars store, journal, screenshots (worker)
+│   ├── reports/              # daily, signal analytics, missed trades, plan comparison
+│   └── ui/                   # PySide6: main window, chart, scoreboard, risk panel, journal, params
 └── tests/
-    ├── unit/                # sizing, FSM transitions, bar building, session edges
-    ├── property/            # hypothesis: risk invariants
-    ├── integration/         # fake Tradovate WS server
-    └── replay/              # recorded sessions → expected decisions
+    ├── unit/                 # sizing, tiers, quote rule, detectors, FSMs, window times incl. DST
+    ├── property/             # hypothesis: risk invariants
+    ├── integration/          # fake Tradovate WS server: full trade lifecycles, disconnects
+    └── fixtures/             # synthetic tick/DOM scenarios (sweep, absorption, divergence)
 ```
 
-| Concern | Choice |
-|---|---|
-| Language | Python 3.12+ |
-| Async I/O | `asyncio`, `websockets`, `httpx` |
-| Models / config | `pydantic` v2, `pydantic-settings` |
-| Data | `polars`, `numpy`, `pyarrow` |
-| Calendars | `exchange_calendars`, `zoneinfo` |
-| Storage | SQLite (via `sqlalchemy` or `sqlite3`), Parquet |
-| Logging / metrics | `structlog`, `prometheus-client` |
-| Testing | `pytest`, `pytest-asyncio`, `hypothesis` |
-| Tooling | `uv`, `ruff`, `mypy --strict` for `risk/` and `execution/` |
-
-### 13.1 Testing invariants worth enforcing
-Property-based tests (`hypothesis`) over random event sequences check that:
-- No order is ever sent without an attached stop.
-- Position size never exceeds `max_contracts`, and per-trade risk never
-  exceeds the budget.
-- After `FLATTEN`, position is 0 and there are no working orders within T
-  seconds (against the fake broker).
-- No entry is ever submitted in `WIND_DOWN`, `POST_RTH`, `CLOSED`, or during
-  a blackout.
-- Replaying a recorded journal produces identical intents
-  (determinism).
+### 14.2 Quality bar (production-grade)
+- **Typing:** `mypy --strict` on everything. `ruff` for linting and
+  formatting. Pre-commit hooks, including a secret scan.
+- **Fake Tradovate server:** an asyncio WebSocket server that speaks the
+  framed protocol. It accepts orders, simulates fills from a scripted
+  price path, and can inject faults: disconnects, penalties, rejects, delayed
+  acknowledgments. All engine integration tests run against it.
+- **Detector fixtures:** handcrafted tick and DOM sequences that must trigger,
+  and must not trigger, each detector. They form a regression suite for the
+  signal math.
+- **Property tests** (`hypothesis`) over random event sequences check that:
+  - there is never more than one position at a time;
+  - no order is sent without a stop;
+  - planned risk never exceeds the budget;
+  - no entry happens outside an ACTIVE window, in cooldown, over the trade
+    cap, or in Tier 2;
+  - after FLATTEN, the account is flat within T seconds;
+  - stop moves never widen risk.
+- **CI:** GitHub Actions runs lint, type-check and tests (headless, Linux) on
+  every push.
 
 ---
 
-## 14. Delivery milestones
+## 15. Configuration (`config/ace.yaml`)
 
-| # | Milestone | Exit criteria |
+```yaml
+environment: demo
+symbols: [MES, MNQ, M2K]
+
+windows:
+  asia:   { start: "19:30", end: "22:00", warmup_min: 3 }
+  london: { start: "02:30", end: "05:00", warmup_min: 3 }
+  rth:    { start: "09:30", end: "16:00", warmup_min: 3 }
+  timezone: America/New_York
+
+signals:
+  weights: { divergence: 0.3333, absorption: 0.3333, sweep: 0.3333 }
+  entry_threshold: 0.55
+  decay_half_life_sec: 60
+  percentile_lookback_days: 5
+  sweep:      { levels: 4, window_ms: 500, burst_pctl: 95, print_pctl: 99 }
+  absorption: { level_vol_pctl: 90, hold_sec: 20, refill_count: 3, delta_pctl: 90, max_progress_ticks: 2 }
+  divergence: { swing_bars: 2, scales: ["1m", "5m"] }
+
+selection:
+  collect_window_ms: 250
+  weights: { signal: 0.6, reward_risk: 0.3, recent: 0.1 }
+
+risk:
+  base_risk_usd: 40            # allowed range 25–50
+  max_trades_per_day: 15
+  loss_cooldown_min: 5
+  tier1_consecutive_losses: 2
+  tier1_multiplier: 0.5
+  tier2_daily_losses: 4
+  peak_drawdown_pct: 10
+  edge_decay: { per_window: true, lookback_trades: 40 }
+  cost_gate_k: 3
+  buffer_ticks: { MES: 2, MNQ: 4, M2K: 3 }
+  max_spread_ticks:
+    rth:    { MES: 1, MNQ: 2, M2K: 2 }
+    london: { MES: 2, MNQ: 3, M2K: 3 }
+    asia:   { MES: 2, MNQ: 4, M2K: 4 }
+  stale_quote_sec: 2
+
+management:
+  breakeven_at_r: 1.0
+  trail: { delta_stall_sec: 20, opposing_strength: 0.5 }
+  target_min_r: 1.0
+
+roll: { method: volume }
+ui: { chart_hz: 5, table_hz: 2 }
+storage: { record_ticks: false, screenshots: true }
+```
+
+Every numeric default above is a **starting point to calibrate during demo**,
+not a tested value.
+
+---
+
+## 16. Milestones
+
+| # | Milestone | Done when |
 |---|---|---|
-| M0 | Skeleton: config, event bus, clock, logging | CI green, `mypy` clean |
-| M1 | Tradovate connectivity (demo): auth, sockets, quotes, tick chart, user sync | 8-hour soak run with reconnects, no leaks |
-| M2 | BarBuilder, indicators, session scheduler, calendar, contract resolver | Bars match vendor data within tolerance; DST and holiday tests pass |
-| M3 | OMS, brackets, reconciliation, kill switch (demo) | Chaos tests: kill the process mid-trade, drop sockets; still recovers to a safe state |
-| M4 | Backtest engine plus ORB strategy; research dataset | Walk-forward report produced |
-| M5 | Full risk manager plus arbiter | Property tests pass |
-| M6 | Replay, then 4–6 weeks of demo trading | Demo vs backtest drift within tolerance |
-| M7 | Live at 1 contract | 4 weeks without operational incidents |
-| M8 | Scale plus S2 (VWAP reversion) | Its own validation track |
+| M0 | Repo skeleton, tooling, CI, config models, `.env` handling | CI green; `ace doctor` runs |
+| M1 | Tradovate demo connectivity: auth, both sockets, quotes, tick chart, DOM, user sync; fake server | 8-hour soak without leaks; tick/bid/ask fields confirmed |
+| M2 | Flow engine: quote rule, bars, delta, volume profile, swings, DOM state; persistence of 1-min flow bars | Bars match Tradovate's charts; classification rate reported |
+| M3 | Windows, scheduler, calendar, roll | DST and holiday tests pass |
+| M4 | Detectors, percentiles, scorer, selector | Fixture suite passes; live scores visible in logs |
+| M5 | Risk (checks, sizing, tiers, locks) and OMS/trade manager on demo | Property tests pass; full trade lifecycle on demo |
+| M6 | PySide6 dashboard (all panels and controls), screenshots, reports | UI stays responsive during RTH open bursts (loop lag under 50 ms p99) |
+| M7 | Demo forward test | Your sign-off |
+| M8 | Live at $25 risk | — |
 
 ---
 
-## 15. Open questions
+## 17. Open items and known risks
 
-1. **Account size and risk appetite:** the actual starting equity sets
-   `risk_pct`, the daily loss limit, and whether 3 symbols × multiple contracts
-   is even feasible.
-2. **Is this a prop firm (funded) account?** If so, the firm's
-   trailing-drawdown and consistency rules must be built into the risk layer
-   and would override Section 8.4.
-3. **ETH trading:** is overnight session trading worth enabling later, or is
-   the bot RTH-only permanently?
-4. **Historical data vendor and budget** for the research dataset.
-5. **Alert channel preference:** Telegram, Discord, SMS or email.
-6. **Hosting:** VPS provider and region.
-7. **Tradovate plan:** the commission tier determines `fees.yaml`, which
-   directly affects which strategies are viable (Section 7.4).
-
----
-
-## Appendix A: Glossary
-
-- **RTH / ETH:** Regular / Extended Trading Hours.
-- **OR:** Opening Range, the high and low of the first N minutes of RTH.
-- **VWAP:** Volume-Weighted Average Price for the session; σ-bands are
-  volume-weighted standard deviations around it.
-- **ATR:** Average True Range, a volatility measure used for stop and size
-  normalization.
-- **R:** the risk unit of a trade (entry-to-stop distance). A 1.5R target is
-  1.5 × that distance.
-- **OSO / OCO:** Order-Sends-Order (the entry triggers its brackets) and
-  One-Cancels-Other (the stop and target cancel each other).
-- **Beta-weighted exposure:** position notional scaled by its sensitivity to
-  the S&P 500, which makes MES, MNQ and M2K exposure additive.
+1. **Costs vs edge (highest risk).** Market entries, the Free plan and 15
+   trades a day make costs large relative to micro tick values (Section 3.1).
+   The demo period has to show a positive expectancy **net of fees**. Plan
+   comparison and the cost gate are the main tools for managing this.
+2. **Tradovate feed limits.** The quote rule depends on accurate bid/ask
+   timing, and Tradovate's DOM depth is limited. If classification quality
+   or absorption detection is poor, a pro feed (Databento or Rithmic) can be
+   added behind the existing data-source interface.
+3. **Demo fill optimism.** Demo market fills are usually better than live.
+   Expect worse live slippage, especially in the Asia window.
+4. **Calibration period.** Each window needs 5 days before its percentile
+   thresholds are meaningful.
+5. **Same-process UI.** This is manageable with the rules in Section 4.2. If
+   loop lag becomes a recurring problem, splitting the UI into its own
+   process is a contained change.
+6. **Unanswered topics** (defaults assumed): growth of risk with equity
+   (fixed for now), report cadence (daily plus on demand), holiday source
+   (calendar library plus a live check).
