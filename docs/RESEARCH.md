@@ -178,17 +178,18 @@ since publication.
   **monthly break-even**: fixed costs ÷ expected trades ÷ expected net profit
   per trade.
 
-## 6. Suggested changes to DESIGN.md (pending your approval)
+## 6. Decisions (applied in DESIGN.md v0.3)
 
-| # | Change | Section |
+| # | Suggestion | Decision |
 |---|---|---|
-| 1 | Add a data-source cost decision: Databento vs Tradovate+ILA | §6.1, §17 |
-| 2 | Compute signals on ES/NQ/RTY, execute on micros | §6.5, §7 |
-| 3 | Add OFI/microprice as a fourth scored signal | §7.4–7.5 |
-| 4 | Hybrid entry (microprice-gated limit, market fallback) as an A/B option | §9.1 |
-| 5 | Signal lab table with forward returns | §10 |
-| 6 | Optional historical backtest step before the demo | §13 |
-| 7 | Recommend the Monthly plan based on expected volume | §3.1 |
+| 1 | Data source | **Databento live (MBP-10 + trades) for data, Tradovate for orders only** (§3.2, §6) |
+| 2 | E-mini signals | **Blend with per-signal sources**: sweeps, absorption, divergence from the E-mini; OFI from the traded micro (§7.5) |
+| 3 | OFI / micro-price | **All three roles**: scored term, entry veto, entry timing (§7.4, §8.1, §9.1) |
+| 4 | Entry execution | **Hybrid by default**, market fallback after 2 s (§9.1) |
+| 5 | Icebergs | **Yes, as an absorption method**, using the MBP-10 heuristic (traded volume above displayed size) (§7.4) |
+| 6 | Signal lab | **Yes**: feature vector, forward returns, MFE/MAE, simulated trade result (§10.1) |
+| 7 | Historical backtest | **No**, demo forward test only |
+| 8 | Commission plan | **Stay on Free**; revisit with the plan calculator |
 
 ---
 
