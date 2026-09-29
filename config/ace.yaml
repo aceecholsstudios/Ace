@@ -1,0 +1,70 @@
+# Ace tunables (design doc Section 15).
+# Every number here is a starting point to calibrate during demo, not a tested value.
+
+environment: demo
+symbols: [MES, MNQ, M2K]
+signal_pairs: { MES: ES, MNQ: NQ, M2K: RTY }
+
+feed:
+  provider: databento
+  dataset: GLBX.MDP3
+  schema: mbp-10
+  symbology: continuous_volume     # e.g. ES.v.0
+  stale_sec: 5
+  snapshot_hz: 20
+
+windows:
+  asia:   { start: "19:30", end: "22:00", warmup_min: 3 }
+  london: { start: "02:30", end: "05:00", warmup_min: 3 }
+  rth:    { start: "09:30", end: "16:00", warmup_min: 3 }
+  timezone: America/New_York
+
+signals:
+  weights: { divergence: 0.25, absorption: 0.25, sweep: 0.25, ofi: 0.25 }
+  sources: { divergence: emini, absorption: emini, sweep: emini, ofi: micro }
+  entry_threshold: 0.55
+  decay_half_life_sec: 60
+  percentile_lookback_days: 5
+  sweep:      { levels: 4, window_ms: 500, burst_pctl: 95, print_pctl: 99 }
+  absorption: { level_vol_pctl: 90, hold_sec: 20, refill_count: 3, delta_pctl: 90, max_progress_ticks: 2 }
+  iceberg:    { hidden_vol_pctl: 90, min_refills: 2 }
+  ofi:        { window_sec: 10, veto_pctl: 90 }
+  divergence: { swing_bars: 2, scales: ["1m", "5m"] }
+
+selection:
+  collect_window_ms: 250
+  weights: { signal: 0.6, reward_risk: 0.3, recent: 0.1 }
+
+risk:
+  base_risk_usd: 40            # allowed range 25–50
+  max_trades_per_day: 15
+  loss_cooldown_min: 5
+  tier1_consecutive_losses: 2
+  tier1_multiplier: 0.5
+  tier2_daily_losses: 4
+  peak_drawdown_pct: 10
+  edge_decay: { per_window: true, lookback_trades: 40 }
+  cost_gate_k: 3
+  buffer_ticks: { MES: 2, MNQ: 4, M2K: 3 }
+  max_spread_ticks:
+    rth:    { MES: 1, MNQ: 2, M2K: 2 }
+    london: { MES: 2, MNQ: 3, M2K: 3 }
+    asia:   { MES: 2, MNQ: 4, M2K: 4 }
+  stale_quote_sec: 2
+  ofi_veto: true
+
+entry:
+  mode: hybrid                     # hybrid | market
+  microprice_lean_frac: 0.2        # of the spread
+  limit_timeout_sec: 2
+  fallback: market
+
+management:
+  breakeven_at_r: 1.0
+  trail: { delta_stall_sec: 20, opposing_strength: 0.5 }
+  target_min_r: 1.0
+
+roll: { method: volume }
+ui: { chart_hz: 5, table_hz: 2 }
+storage: { record_ticks: false, screenshots: true }
+lab: { enabled: true, horizons_sec: [30, 60, 180, 600] }

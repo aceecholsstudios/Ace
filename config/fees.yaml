@@ -1,0 +1,11 @@
+# Per-contract fees, in USD per side, on the Tradovate Free plan.
+# These are REPORTED figures, not verified ones. Replace them with the exact
+# numbers from your own Tradovate statement (design doc Section 3.1). CME
+# exchange fees change on 2026-10-01.
+plan: free
+verified: false   # set to true once copied from a real statement
+
+per_side:
+  MES: { commission: 0.39, exchange: 0.35, clearing: 0.0, nfa: 0.02 }
+  MNQ: { commission: 0.39, exchange: 0.35, clearing: 0.0, nfa: 0.02 }
+  M2K: { commission: 0.39, exchange: 0.35, clearing: 0.0, nfa: 0.02 }
