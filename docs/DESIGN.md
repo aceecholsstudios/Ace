@@ -48,7 +48,8 @@ edits.
 | Account / capital | Personal Tradovate cash account, under $5k |
 | Commission plan | Tradovate Free plan (pay per trade) |
 | Instruments | MES, MNQ, M2K traded (micros only); ES, NQ, RTY read for signals |
-| Trading windows | Asia 19:30–22:00 ET · London 02:30–05:00 ET · RTH 09:30–16:00 ET |
+| Trading windows | Asia 18:30–21:00 CT · London 01:30–04:00 CT · RTH 08:30–15:00 CT |
+| Time zone | **All times in US Central (CT)**, the exchange's own zone |
 | Window start | Wait 2–5 minutes after each window opens |
 | Window end | Flatten any open trade when the window closes |
 | Holding period | 1–10 minutes typical, **no** hard time stop |
@@ -280,13 +281,15 @@ tests and CI, and it keeps the engine independent of the UI code.
 ## 5. Sessions and trading windows
 
 All internal timestamps are UTC. Window logic uses `zoneinfo`
-(`America/New_York`), so daylight-saving changes are handled correctly.
+(`America/Chicago`, US Central), so daylight-saving changes are handled
+correctly. **Every time in this document, the config and the dashboard is
+Central Time (CT).**
 
-| Window | Hours (ET) | No-trade warmup | Notes |
+| Window | Hours (CT) | No-trade warmup | Notes |
 |---|---|---|---|
-| **Asia** | 19:30–22:00 | first 2–5 min (config) | Thinner books. Spread checks and percentile thresholds are specific to this window. |
-| **London** | 02:30–05:00 | first 2–5 min | Best overnight liquidity. |
-| **RTH** | 09:30–16:00 | first 2–5 min | Most activity. The 09:30 open is the most volatile moment of the day. |
+| **Asia** | 18:30–21:00 | first 2–5 min (config) | Thinner books. Spread checks and percentile thresholds are specific to this window. |
+| **London** | 01:30–04:00 | first 2–5 min | Best overnight liquidity. |
+| **RTH** | 08:30–15:00 | first 2–5 min | Most activity. The 08:30 open is the most volatile moment of the day. |
 
 ### 5.1 Window state machine
 ```
@@ -306,8 +309,8 @@ IDLE ──(T-10m)──► PREPARING ──(open)──► WARMUP ──(+N min
 ### 5.2 News
 You chose to ignore scheduled news. No economic calendar is used. Protection
 still comes from the always-on checks: a spread limit, a quote-freshness
-limit, and the stop set at entry. Releases such as CPI at 08:30 ET and FOMC at
-14:00 ET fall inside or near RTH, so expect occasional large slippage on
+limit, and the stop set at entry. Releases such as CPI at 07:30 CT and FOMC at
+13:00 CT fall inside or near RTH, so expect occasional large slippage on
 those days. The journal tags trades taken within ±5 minutes of the top-tier
 release times so their effect can be measured later.
 
@@ -652,7 +655,7 @@ statistics.
 ### 8.3 Daily tiers (count-based)
 | State | Trigger | Effect |
 |---|---|---|
-| **Normal** | Start of each trading day (18:00 ET roll) | Full base risk |
+| **Normal** | Start of each trading day (17:00 CT roll) | Full base risk |
 | **Tier 1 (half size)** | 2 consecutive losses | `tier_multiplier = 0.5` until a winning trade resets it |
 | **Tier 2 (stopped)** | 4 losing trades on the day | No new entries until the next trading day |
 
@@ -998,10 +1001,10 @@ feed:
   snapshot_hz: 20
 
 windows:
-  asia:   { start: "19:30", end: "22:00", warmup_min: 3 }
-  london: { start: "02:30", end: "05:00", warmup_min: 3 }
-  rth:    { start: "09:30", end: "16:00", warmup_min: 3 }
-  timezone: America/New_York
+  asia:   { start: "18:30", end: "21:00", warmup_min: 3 }
+  london: { start: "01:30", end: "04:00", warmup_min: 3 }
+  rth:    { start: "08:30", end: "15:00", warmup_min: 3 }
+  timezone: America/Chicago
 
 signals:
   weights: { divergence: 0.25, absorption: 0.25, sweep: 0.25, ofi: 0.25 }
