@@ -1,0 +1,46 @@
+# wall2 configuration. All times are US Central (America/Chicago).
+timezone: America/Chicago
+mode: paper                       # paper | live
+underlyings: [SPY, QQQ, IWM]
+
+session:
+  autostart: "08:00"
+  first_entry: "08:35"
+  closeout_minutes_before_close: 10   # 14:50 CT normally, 11:50 CT on half-days
+  report_at: "15:15"
+
+signals:
+  ema_len: 9
+  trend_minutes: 15                 # trend = 15-min close vs VWAP
+  entry_minutes: 5                  # pullback = 5-min bar touches the 9 EMA
+  setup_ttl_bars: 2                 # 1-min trigger must come within 2 five-minute bars
+  warmup_days: 3
+
+selection:
+  budget_usd: 20
+  target_delta_low: 0.30
+  target_delta_high: 0.40
+  min_delta: 0.10
+  min_bid: 0.05
+  tie_delta_tolerance: 0.02
+  fallback_annual_vol: {SPY: 0.16, QQQ: 0.20, IWM: 0.22}
+
+orders:
+  fill_wait_sec: 5
+  reprice_attempts: 1
+  profit_exit_mid_wait_sec: 5
+  exit_bid_retries: 10
+  cancel_confirm_timeout_sec: 10
+
+management:
+  tighten_after_gain_pct: 100
+  salvage_min_value_pct: 50
+
+risk:
+  max_trades_per_day: 3
+  one_position_per_etf: true
+  settled_cash_only: true
+  halt_stale_sec: 15
+  halt_resume_healthy_sec: 120
+
+fees_per_contract: 0.00             # per side; set from your Webull statement

@@ -573,15 +573,38 @@ risk:
 
 ---
 
+## 13a. Implementation notes (interpretations made while building)
+
+These came up in code where your answers didn't fully specify the behavior. Each one is easy
+to change.
+
+| Topic | What the code does | Why |
+|---|---|---|
+| Trend before 8:45 CT | Until the first 15-min bar completes, the trend is the latest **1-min close vs VWAP** (provisional) | You chose first entry at 8:35, before any 15-min bar exists |
+| Direction lock | Lifts when **any** completed 15-min bar closes on the other side of VWAP | Matches "until the trend flips across VWAP" |
+| Tightened trail (after +100%) | **1-min closes** checked against the **5-min 9 EMA** | One EMA for both rules; the tighter rule just checks it more often |
+| Delta fallback | Moneyness delta = Φ((S−K)/σ_move), with σ_move taken from the ATM straddle (≈ 0.8·σ), else from a configured annual volatility | Uses the market's own expected move when available |
+| Cheapest fit | Applies to signals on the **same 1-min close**; after the best one, others still trade if caps and cash allow | "Cheapest fit" is about choosing among simultaneous signals |
+| Shadow log | Skipped signals are shadow-tracked only when a contract was selectable; others are logged with the reason only | There's no "would-be" option to follow otherwise |
+| Exits with no bid | Contracts with no bid stay open and expire worthless | A worthless option can't be sold |
+| Stray positions | Adopted only on SPY, QQQ, IWM (the bot has no chart data for anything else); others are logged and ignored | Trailing rules need the underlying's bars |
+| Order stuck after cancel | Trading pauses and an event is logged | A position of unknown size must not be traded around |
+
+**Simulation finding:** in synthetic sessions (model prices with 18% volatility), $20 rarely
+bought a SPY or QQQ option at or above the 0.10 delta floor; IWM usually was the only fit.
+Real prices will differ, but expect IWM to dominate at this budget.
+
+---
+
 ## 14. Milestones
 
 | # | Milestone | Done when |
 |---|---|---|
-| M0 | Skeleton, config, CT clock, calendar, simulator broker | Tests run; `wall2 check` works |
+| M0 ✅ | Skeleton, config, CT clock, calendar, simulator broker | Tests run; `wall2 check` works |
 | M1 | **Webull API verification** (on your PC): chains, greeks, orders, cash, streaming, paper | All items in Section 10 answered; fallback decided if needed |
 | M2 | Data: streaming, bars, VWAP/EMA, warmup | Indicators match a reference chart |
-| M3 | Signals and contract selection | Fixture tests pass; signals visible in logs |
-| M4 | Risk gate, settlement ledger, order and position managers | Core tests pass on the simulator |
+| M3 ✅ | Signals and contract selection | Fixture tests pass; signals visible in logs |
+| M4 ✅ | Risk gate, settlement ledger, order and position managers | Core tests pass on the simulator |
 | M5 | Dashboard, screenshots, shadow tracker, daily report | Full paper day runs unattended |
 | M6 | 4 weeks of paper trading | Your go-live decision |
 | M7 | Live at $20 per trade | — |
