@@ -5,21 +5,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
-from wall2.broker.simulator import SimBroker
 from wall2.broker.webull import WebullSettings
 from wall2.config import Wall2Config, load_config
-from wall2.core.clock import CT, RealClock, SimClock
-from wall2.core.types import Bar
-from wall2.engine import Engine
+from wall2.core.clock import CT, RealClock
 from wall2.persistence.db import Store
 from wall2.reports.daily import write_report
 from wall2.session.calendar import TradingCalendar
+from wall2.sim.demo import build_demo
 from wall2.sim.replay import run_sim_day
-from wall2.sim.synthetic import scripted_path
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -59,44 +56,18 @@ def cmd_check(args: argparse.Namespace) -> int:
 def cmd_demo(args: argparse.Namespace) -> int:
     """A synthetic simulated session through the real engine. Model prices, not market data."""
     cfg = _cfg(args.config)
-    cal = TradingCalendar(cfg.session)
     day = date.fromisoformat(args.date)
-    plan = cal.plan(day)
-    if plan is None:
-        print(f"{day} is not a trading session", file=sys.stderr)
-        return 2
-    start = {"SPY": 600.0, "QQQ": 520.0, "IWM": 220.0}
     out = Path(args.out)
-    store = Store(out / "demo.db")
-    clock = SimClock(plan.open - timedelta(hours=1))
-    broker = SimBroker(Decimal(args.cash), cfg.fees_per_contract)
-    eng = Engine(cfg, broker, store, clock, cal)
-    minutes: dict[str, list[Bar]] = {}
-    n = int((plan.close - plan.open).total_seconds() // 60)
-    for u in cfg.underlyings:
-        p0 = start[u]
-        eng.warmup(
-            u,
-            [
-                Bar(
-                    u,
-                    datetime.combine(day, plan.open.timetz()) - timedelta(days=1, minutes=5 * i),
-                    5,
-                    p0,
-                    p0,
-                    p0,
-                    p0,
-                    1,
-                )
-                for i in range(20, 0, -1)
-            ],
-        )
-        minutes[u] = list(
-            scripted_path(u, day, plan.open, n, p0, args.drift * p0 / 600, 0.0012 * p0, 35)
-        )
-    res = asyncio.run(run_sim_day(eng, broker, clock, day, minutes, vol=args.vol))
-    path = write_report(store, day, out)
-    trades = store.rows("SELECT * FROM trades WHERE day = ?", day)
+    try:
+        demo = build_demo(cfg, day, args.cash, out, args.drift)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 2
+    res = asyncio.run(
+        run_sim_day(demo.engine, demo.broker, demo.clock, day, demo.minutes, vol=args.vol)
+    )
+    path = write_report(demo.store, day, out)
+    trades = demo.store.rows("SELECT * FROM trades WHERE day = ?", day)
     net = sum((Decimal(t["pnl"]) for t in trades if t["pnl"]), Decimal(0))
     print(
         f"SYNTHETIC demo {day}: {len(trades)} trades, net {net:+.2f}, "
@@ -104,6 +75,29 @@ def cmd_demo(args: argparse.Namespace) -> int:
     )
     print(f"report: {path}")
     return 0
+
+
+def cmd_ui(args: argparse.Namespace) -> int:
+    try:
+        from wall2.ui.run import run_demo_ui
+    except ImportError as e:
+        print(f"Dashboard needs the UI extra: `uv sync --extra ui` ({e})", file=sys.stderr)
+        return 2
+    if not args.demo:
+        print(
+            "The live dashboard needs the Webull adapter (M1). Use `wall2 ui --demo`.",
+            file=sys.stderr,
+        )
+        return 2
+    return run_demo_ui(
+        _cfg(args.config),
+        date.fromisoformat(args.date),
+        Path(args.out),
+        args.drift,
+        args.pace,
+        Path(args.snap) if args.snap else None,
+        args.snap_after,
+    )
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -141,6 +135,15 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--db", default="data/wall2.db")
     r.add_argument("--out", default="reports")
     r.set_defaults(fn=cmd_report)
+    ui = sub.add_parser("ui", help="open the dashboard (today: --demo plays a SYNTHETIC session)")
+    ui.add_argument("--demo", action="store_true")
+    ui.add_argument("--date", default="2026-10-02")
+    ui.add_argument("--drift", type=float, default=0.02)
+    ui.add_argument("--pace", type=float, default=0.25, help="seconds per simulated minute")
+    ui.add_argument("--out", default="data/demo-ui")
+    ui.add_argument("--snap", help=argparse.SUPPRESS)  # save a screenshot and exit (testing)
+    ui.add_argument("--snap-after", type=int, default=120, help=argparse.SUPPRESS)
+    ui.set_defaults(fn=cmd_ui)
     sub.add_parser("run", help="trade (paper/live) — available after M1").set_defaults(fn=cmd_run)
     args = ap.parse_args(argv)
     return int(args.fn(args))

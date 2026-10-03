@@ -11,6 +11,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from wall2.core.types import Bar
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS signals (
     id INTEGER PRIMARY KEY,
@@ -26,7 +28,16 @@ CREATE TABLE IF NOT EXISTS trades (
     right_ TEXT NOT NULL, strike TEXT NOT NULL, qty INTEGER NOT NULL, adopted INTEGER NOT NULL,
     entry_ts TEXT NOT NULL, entry_price TEXT NOT NULL, entry_fees TEXT NOT NULL, delta REAL,
     exit_ts TEXT, exit_price TEXT, exit_fees TEXT, exit_reason TEXT, unsold INTEGER, pnl TEXT,
-    screenshot TEXT
+    entry_spot REAL, exit_spot REAL, trigger_level REAL, screenshot TEXT
+);
+CREATE TABLE IF NOT EXISTS bars (
+    underlying TEXT NOT NULL, start TEXT NOT NULL, open REAL, high REAL, low REAL, close REAL,
+    volume REAL, PRIMARY KEY (underlying, start)
+);
+CREATE TABLE IF NOT EXISTS entry_bars (
+    underlying TEXT NOT NULL, day TEXT NOT NULL, start TEXT NOT NULL,
+    open REAL, high REAL, low REAL,
+    close REAL, ema REAL, vwap REAL, PRIMARY KEY (underlying, start)
 );
 CREATE TABLE IF NOT EXISTS shadow (
     id INTEGER PRIMARY KEY,
@@ -93,6 +104,31 @@ class Store:
 
     def close_shadow(self, shadow_id: int, **cols: Any) -> None:
         self._update("shadow", shadow_id, **cols)
+
+    def add_bar(self, underlying: str, b: Bar) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO bars VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [underlying, b.start.isoformat(), b.open, b.high, b.low, b.close, b.volume],
+        )
+
+    def add_entry_bar(self, underlying: str, b: Bar, ema: float | None, vwap: float | None) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO entry_bars VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                underlying,
+                b.start.date().isoformat(),
+                b.start.isoformat(),
+                b.open,
+                b.high,
+                b.low,
+                b.close,
+                ema,
+                vwap,
+            ],
+        )
+
+    def commit(self) -> None:
+        self.conn.commit()
 
     def event(self, ts: datetime, kind: str, detail: str = "") -> None:
         self._insert("events", ts=ts, kind=kind, detail=detail)

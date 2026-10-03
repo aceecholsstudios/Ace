@@ -589,6 +589,8 @@ to change.
 | Exits with no bid | Contracts with no bid stay open and expire worthless | A worthless option can't be sold |
 | Stray positions | Adopted only on SPY, QQQ, IWM (the bot has no chart data for anything else); others are logged and ignored | Trailing rules need the underlying's bars |
 | Order stuck after cancel | Trading pauses and an event is logged | A position of unknown size must not be traded around |
+| Bar storage | 1-min and 5-min bars stored in **SQLite** (not Parquet) | Volumes are tiny; avoids an extra dependency |
+| Trade "screenshots" | **SVG charts** generated from stored bars and embedded in the daily report | No plotting library or screen capture needed; works headless |
 
 **Simulation finding:** in synthetic sessions (model prices with 18% volatility), $20 rarely
 bought a SPY or QQQ option at or above the 0.10 delta floor; IWM usually was the only fit.
@@ -605,6 +607,6 @@ Real prices will differ, but expect IWM to dominate at this budget.
 | M2 | Data: streaming, bars, VWAP/EMA, warmup | Indicators match a reference chart |
 | M3 ✅ | Signals and contract selection | Fixture tests pass; signals visible in logs |
 | M4 ✅ | Risk gate, settlement ledger, order and position managers | Core tests pass on the simulator |
-| M5 | Dashboard, screenshots, shadow tracker, daily report | Full paper day runs unattended |
+| M5 ✅* | Dashboard, screenshots, shadow tracker, daily report | Full paper day runs unattended (*built and tested on synthetic sessions; the paper-day check needs M1) |
 | M6 | 4 weeks of paper trading | Your go-live decision |
 | M7 | Live at $20 per trade | — |

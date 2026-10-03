@@ -655,6 +655,18 @@ wheels = [
 ]
 
 [[package]]
+name = "pyqtgraph"
+version = "0.14.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama" },
+    { name = "numpy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/32/36/4c242f81fdcbfa4fb62a5645f6af79191f4097a0577bd5460c24f19cc4ef/pyqtgraph-0.14.0-py3-none-any.whl", hash = "sha256:7abb7c3e17362add64f8711b474dffac5e7b0e9245abdf992e9a44119b7aa4f5", size = 1924755, upload-time = "2025-11-16T19:43:22.251Z" },
+]
+
+[[package]]
 name = "pyside6"
 version = "6.11.2"
 source = { registry = "https://pypi.org/simple" }
@@ -923,6 +935,7 @@ dependencies = [
 
 [package.optional-dependencies]
 ui = [
+    { name = "pyqtgraph" },
     { name = "pyside6" },
     { name = "qasync" },
 ]
@@ -942,6 +955,7 @@ requires-dist = [
     { name = "exchange-calendars", specifier = ">=4.5" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pydantic-settings", specifier = ">=2.3" },
+    { name = "pyqtgraph", marker = "extra == 'ui'", specifier = ">=0.13" },
     { name = "pyside6", marker = "extra == 'ui'", specifier = ">=6.7" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "qasync", marker = "extra == 'ui'", specifier = ">=0.27" },

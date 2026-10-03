@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 from wall2.broker.base import Broker
+from wall2.charts.svg import ChartBar, Marker, render_trade_svg
 from wall2.config import Wall2Config
 from wall2.core.clock import Clock
-from wall2.core.types import CONTRACT_MULTIPLIER, Bar, Signal
+from wall2.core.types import CONTRACT_MULTIPLIER, Bar, Direction, Right, Signal
 from wall2.execution.orders import EntryFill, OrderManager, OrderStuck
 from wall2.execution.position import ExitDecision, ExitReason, Position, PositionRules
 from wall2.persistence.db import Store
@@ -30,10 +32,48 @@ from wall2.signals.setup import TrendUpdate, UnderlyingTracker
 log = logging.getLogger("wall2.engine")
 
 
-@dataclass(slots=True)
-class _Pending:
-    signal: Signal
-    signal_id: int
+@dataclass(frozen=True, slots=True)
+class PositionView:
+    symbol: str
+    underlying: str
+    right: Right
+    strike: Decimal
+    qty: int
+    entry: Decimal
+    bid: Decimal | None
+    gain_pct: float | None
+    tightened: bool
+    adopted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class UnderlyingView:
+    symbol: str
+    price: float | None
+    trend: Direction | None
+    vwap: float | None
+    ema: float | None
+    armed_level: float | None
+    enabled: bool
+    halted: bool
+    direction_lock: Direction | None
+
+
+@dataclass(frozen=True, slots=True)
+class Snapshot:
+    """A read-only view of engine state for the dashboard."""
+
+    now: datetime
+    mode: str
+    plan: SessionPlan | None
+    trades_today: int
+    max_trades: int
+    settled: Decimal
+    unsettled: Decimal
+    budget: Decimal
+    paused: bool
+    positions: list[PositionView]
+    underlyings: list[UnderlyingView] = field(default_factory=list)
 
 
 class Engine:
@@ -44,6 +84,7 @@ class Engine:
         store: Store,
         clock: Clock,
         calendar: TradingCalendar,
+        shots_dir: Path | None = None,
     ) -> None:
         self.cfg = cfg
         self.broker = broker
@@ -64,6 +105,8 @@ class Engine:
         self.positions: list[Position] = []
         self._last_entry_bar: dict[str, datetime] = {}
         self._closed_out = False
+        self.shots_dir = shots_dir
+        self.history: dict[str, list[ChartBar]] = {u: [] for u in cfg.underlyings}
 
     # ---- session lifecycle -----------------------------------------------------------------
     def warmup(self, underlying: str, entry_bars: list[Bar]) -> None:
@@ -83,6 +126,7 @@ class Engine:
         self.store.cash(day, settled_open=self.ledger.settled)
         for u, t in self.trackers.items():
             t.start_session()
+            self.history[u] = []
             chain = await self.broker.option_chain(u, day)
             if not chain:
                 self.day.disabled_etfs.add(u)
@@ -131,10 +175,17 @@ class Engine:
                         self.store.event(now, "trend-flip", f"{u} {ev.direction}")
                 else:
                     signals.append(ev)
+            self.store.add_bar(u, bar)
             eb = t.last_entry_bar
             if eb is not None and self._last_entry_bar.get(u) != eb.start:
                 self._last_entry_bar[u] = eb.start
                 new_entry_bar.add(u)
+                ema, vwap = t.ema.value, t.vwap.value
+                self.history[u].append(
+                    ChartBar(eb.start, eb.open, eb.high, eb.low, eb.close, ema, vwap)
+                )
+                self.store.add_entry_bar(u, eb, ema, vwap)
+        self.store.commit()
 
         try:
             await self._manage_exits(new_entry_bar)
@@ -155,6 +206,7 @@ class Engine:
             if ema is None or t.last_minute is None:
                 continue
             q = await self.broker.option_quote(pos.contract)
+            pos.last_bid = q.bid
             decision: ExitDecision | None = None
             if pos.underlying in new_entry_bar and t.last_entry_bar is not None:
                 decision = self.rules.on_entry_bar_close(pos, t.last_entry_bar.close, ema, q.bid)
@@ -196,11 +248,15 @@ class Engine:
     ) -> None:
         if pos.trade_id is None:
             return
-        row = self.store.rows("SELECT entry_fees FROM trades WHERE id = ?", pos.trade_id)[0]
+        row = self.store.rows("SELECT * FROM trades WHERE id = ?", pos.trade_id)[0]
         pnl = (
             (price - pos.entry_price) * CONTRACT_MULTIPLIER * qty
             - exit_fees
             - Decimal(row["entry_fees"])
+        )
+        spot = self.trackers[pos.underlying].last_price
+        shot = self._screenshot(
+            pos, row["trigger_level"], row["entry_spot"], spot, price, reason, now
         )
         self.store.close_trade(
             pos.trade_id,
@@ -210,7 +266,40 @@ class Engine:
             exit_reason=reason,
             unsold=pos.qty - qty,
             pnl=pnl.quantize(Decimal("0.01")),
+            exit_spot=spot,
+            screenshot=shot,
         )
+
+    def _screenshot(
+        self,
+        pos: Position,
+        trigger: float | None,
+        entry_spot: float | None,
+        exit_spot: float | None,
+        exit_price: Decimal,
+        reason: str,
+        now: datetime,
+    ) -> str | None:
+        """Write the trade's chart (SVG) and return its path, if a shots directory is set."""
+        if self.shots_dir is None:
+            return None
+        lo, hi = pos.opened_at - timedelta(minutes=75), now + timedelta(minutes=20)
+        bars = [b for b in self.history.get(pos.underlying, []) if lo <= b.start <= hi]
+        if not bars:
+            return None
+        markers = []
+        if entry_spot is not None:
+            markers.append(Marker(pos.opened_at, entry_spot, f"buy {pos.entry_price:.2f}", "entry"))
+        if exit_spot is not None:
+            markers.append(Marker(now, exit_spot, f"sell {exit_price:.2f}", "exit"))
+        c = pos.contract
+        title = (
+            f"{c.underlying} {c.strike} {c.right} · {pos.opened_at:%H:%M}–{now:%H:%M} CT · {reason}"
+        )
+        self.shots_dir.mkdir(parents=True, exist_ok=True)
+        path = self.shots_dir / f"{now:%Y-%m-%d}_{pos.trade_id}.svg"
+        path.write_text(render_trade_svg(bars, title, markers, trigger), encoding="utf-8")
+        return str(path)
 
     async def closeout(self) -> None:
         """14:50 CT (11:50 on half-days): sell anything in the money; leave OTM to expire."""
@@ -331,6 +420,8 @@ class Engine:
             entry_price=f.price,
             entry_fees=f.fees,
             delta=sel.delta,
+            entry_spot=self.trackers[c.underlying].last_price,
+            trigger_level=sel.signal.trigger_level,
         )
         self.positions.append(pos)
         self.store.update_signal(
@@ -361,6 +452,51 @@ class Engine:
         now = self.clock.now()
         pos = Position(sel.quote.contract, sel.contracts, sel.quote.ask, now)
         self.shadow.start(sid, now.date(), pos)
+
+    # ---- dashboard view --------------------------------------------------------------------
+    def snapshot(self) -> Snapshot:
+        pv = [
+            PositionView(
+                p.contract.symbol,
+                p.underlying,
+                p.contract.right,
+                p.contract.strike,
+                p.qty,
+                p.entry_price,
+                p.last_bid,
+                p.gain_pct(p.last_bid) if p.last_bid is not None else None,
+                self.rules.tightened(p),
+                p.adopted,
+            )
+            for p in self.positions
+        ]
+        uv = [
+            UnderlyingView(
+                u,
+                t.last_price,
+                t.trend,
+                t.vwap.value,
+                t.ema.value,
+                t.armed_level,
+                u not in self.day.disabled_etfs,
+                u in self.day.halted_etfs,
+                self.day.direction_lock.get(u),
+            )
+            for u, t in self.trackers.items()
+        ]
+        return Snapshot(
+            self.clock.now(),
+            self.cfg.mode,
+            self.plan,
+            self.day.trades_today,
+            self.cfg.risk.max_trades_per_day,
+            self.ledger.settled,
+            self.ledger.unsettled,
+            self.budget,
+            self.day.paused,
+            pv,
+            uv,
+        )
 
     # ---- operator commands -----------------------------------------------------------------
     def pause(self) -> None:

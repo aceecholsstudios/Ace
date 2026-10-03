@@ -40,6 +40,7 @@ class Position:
     adopted: bool = False
     peak_gain_pct: float = 0.0
     trade_id: int | None = None
+    last_bid: Decimal | None = None
 
     @property
     def underlying(self) -> str:

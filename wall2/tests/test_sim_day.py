@@ -121,3 +121,19 @@ async def test_skip_reasons_are_not_mixed() -> None:
     for r in store.rows("SELECT reject_reason FROM signals WHERE outcome='skipped'"):
         reason = r["reject_reason"]
         assert reason.startswith("no contract fits") or ":" not in reason, reason
+
+
+async def test_trade_charts_written_and_embedded(tmp_path) -> None:
+    cfg = Wall2Config(orders=FAST)
+    clock = SimClock(ct(7, 0, DAY))
+    broker = SimBroker(Decimal("5000"))
+    store = Store(":memory:")
+    eng = Engine(cfg, broker, store, clock, TradingCalendar(cfg.session), shots_dir=tmp_path)
+    warm(eng, START)
+    await run_sim_day(eng, broker, clock, DAY, paths(0.02, START))
+    shots = [r["screenshot"] for r in store.rows("SELECT screenshot FROM trades")]
+    assert shots and all(s and s.endswith(".svg") for s in shots)
+    html = build_report(store, DAY)
+    assert html.count("<svg") == len(shots)
+    snap = eng.snapshot()
+    assert snap.trades_today == len(shots) and len(snap.underlyings) == 3

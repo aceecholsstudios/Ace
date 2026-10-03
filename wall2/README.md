@@ -15,7 +15,8 @@ trend pullbacks. Design: [`docs/wall2/DESIGN.md`](../docs/wall2/DESIGN.md). **Al
 | Shadow log, SQLite store, daily HTML report | ✅ built, tested |
 | Simulator broker + synthetic full-day replays | ✅ built, tested |
 | **Webull adapter** | ⏳ M1, on your PC (`src/wall2/broker/webull.py` lists what to verify) |
-| PySide6 dashboard, trade screenshots | ⏳ next |
+| Trade charts (SVG, embedded in the report) | ✅ built, tested |
+| PySide6 dashboard (charts, positions, journal, controls) | ✅ built; demo mode only until M1 |
 
 ## Setup (Windows or Linux)
 
@@ -25,6 +26,9 @@ uv sync                 # Python 3.12 + dependencies
 uv run pytest           # tests
 uv run wall2 check      # validate config, show today's session plan in CT
 uv run wall2 demo       # one SYNTHETIC simulated session → data/demo/<date>.html
+
+uv sync --extra ui      # dashboard dependencies (PySide6, pyqtgraph, qasync)
+uv run wall2 ui --demo  # dashboard playing a SYNTHETIC session (--pace = seconds per minute)
 ```
 
 `wall2 demo` runs the real engine against model (Black-Scholes) prices. It exercises the
@@ -50,5 +54,7 @@ src/wall2/
   shadow/           skipped-signal tracking
   persistence/      SQLite store
   reports/          daily HTML report
+  charts/           per-trade SVG charts
+  ui/               PySide6 dashboard
   sim/              synthetic markets and day replays
 ```

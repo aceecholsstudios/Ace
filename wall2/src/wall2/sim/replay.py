@@ -3,6 +3,8 @@ synthetic option chain re-priced every minute. Used by tests and the `wall2 demo
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
@@ -29,6 +31,9 @@ async def run_sim_day(
     minutes: dict[str, list[Bar]],
     vol: float = 0.18,
     with_greeks: bool = True,
+    pace_sec: float = 0.0,
+    after_minute: Callable[[], Awaitable[None]] | None = None,
+    stop: asyncio.Event | None = None,
 ) -> SimDayResult:
     plan = engine.calendar.plan(day)
     if plan is None:
@@ -64,6 +69,12 @@ async def run_sim_day(
             reprice(u, b.close)
             last[u] = b.close
         await engine.on_minute(row)
+        if after_minute is not None:
+            await after_minute()
+        if stop is not None and stop.is_set():
+            break
+        if pace_sec:
+            await asyncio.sleep(pace_sec)
     clock.set(max(clock.now(), plan.close))
     await engine.end_of_day()
     exercised = broker.expire(day, last)
